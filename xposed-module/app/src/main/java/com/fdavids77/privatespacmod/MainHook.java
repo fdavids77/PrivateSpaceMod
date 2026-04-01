@@ -1,8 +1,16 @@
 package com.fdavids77.privatespacmod;
 
+import android.content.Context;
 import android.content.res.Resources;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.UserHandle;
+import android.os.UserManager;
 import android.view.View;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -11,12 +19,13 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod — Unified LSPosed module
+ * PrivateSpaceMod v2.0 — Unified LSPosed module
  *
- * Hooks into Pixel Launcher (com.google.android.apps.nexuslauncher) to:
+ * Single module that does everything:
  *   1. Hide "Private" label + lock icon (PSLabelHider v1.15 logic)
- *   2. Intercept double-tap home screen gesture → trigger Private Space unlock
- *   3. Show a mini app-picker overlay after unlock
+ *   2. Double-tap home screen → unlock Private Space directly
+ *      (calls requestQuietModeEnabled inline from Pixel Launcher process,
+ *       which is foreground default launcher — no separate app needed)
  *
  * Target: Pixel 9 Pro XL, Android 15/16, Magisk + LSPosed (JingMatrix/Vector)
  * Author: fdavids77
@@ -25,18 +34,16 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "PSMod";
     private static final String LAUNCHER_PKG = "com.google.android.apps.nexuslauncher";
-    private static final String SYSTEMUI_PKG = "com.android.systemui";
+    private static final int PRIVATE_SPACE_USER_ID = 10;
+    private static boolean isUnlocking = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (lpparam.packageName.equals(LAUNCHER_PKG)) {
-            XposedBridge.log(TAG + ": Hooking Pixel Launcher");
-            hookLabelHider(lpparam);
-            hookDoubleTapGesture(lpparam);
-        } else if (lpparam.packageName.equals(SYSTEMUI_PKG)) {
-            XposedBridge.log(TAG + ": Hooking SystemUI for QS tile backup");
-            // QS tile hooks handled by the priv-app TileService, no LSPosed hook needed
-        }
+        if (!lpparam.packageName.equals(LAUNCHER_PKG)) return;
+
+        XposedBridge.log(TAG + ": Hooking Pixel Launcher");
+        hookLabelHider(lpparam);
+        hookDoubleTapGesture(lpparam);
     }
 
     // =========================================================================
@@ -95,7 +102,6 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void hookPrivateProfileManager(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Try multiple class names across Android 15/16 Pixel Launcher versions
         String[] classNames = {
                 "com.android.launcher3.model.data.PrivateProfileManager",
                 "com.android.launcher3.pm.PrivateProfileManager",
@@ -106,7 +112,6 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
 
-                // Hook updateView — force hide lock-related views
                 try {
                     XposedHelpers.findAndHookMethod(clazz, "updateView",
                             new XC_MethodHook() {
@@ -118,7 +123,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 } catch (NoSuchMethodError ignored) {
                 }
 
-                // Hook bind — same treatment
                 try {
                     XposedHelpers.findAndHookMethod(clazz, "bind",
                             new XC_MethodHook() {
@@ -131,7 +135,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
 
                 XposedBridge.log(TAG + ": Hooked PrivateProfileManager: " + className);
-                break; // Found the right class
+                break;
             } catch (XposedHelpers.ClassNotFoundError ignored) {
             }
         }
@@ -139,16 +143,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void hidePrivateSpaceSettingsViews(Object manager) {
         try {
-            // Navigate from mPrivateSpaceSettingsButton to parent container
             Object settingsButton = XposedHelpers.getObjectField(manager, "mPrivateSpaceSettingsButton");
             if (settingsButton instanceof View) {
                 View btn = (View) settingsButton;
                 btn.setVisibility(View.GONE);
-
-                // Walk up to hide the parent group too
                 if (btn.getParent() instanceof View) {
-                    View parent = (View) btn.getParent();
-                    parent.setVisibility(View.GONE);
+                    ((View) btn.getParent()).setVisibility(View.GONE);
                 }
             }
         } catch (NoSuchFieldError | ClassCastException e) {
@@ -157,64 +157,18 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // PART 2: Double-Tap Gesture → Private Space Unlock + App Picker
+    // PART 2: Double-Tap → Unlock Private Space (inline, no separate app)
     // =========================================================================
 
     private void hookDoubleTapGesture(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Pixel Launcher uses Workspace or DragLayer for gesture handling.
-        // The double-tap-to-sleep gesture is handled via a GestureDetector callback.
-        // We hook the launcher's onDoubleTap handler and redirect it.
-
-        // Strategy: Hook GestureDetector.OnDoubleTapListener implementations
-        // within the launcher's Workspace class.
-
-        // Approach 1: Hook the Workspace class's gesture handler
-        hookWorkspaceDoubleTap(lpparam);
-
-        // Approach 2: Hook the WorkspaceTouchListener (confirmed on device)
-        hookLauncherDoubleTap(lpparam);
-    }
-
-    private void hookWorkspaceDoubleTap(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Pixel Launcher's Workspace extends from AOSP launcher3 Workspace
-        String[] workspaceClasses = {
-                "com.android.launcher3.Workspace",
-                "com.google.android.apps.nexuslauncher.NexusWorkspace"
-        };
-
-        for (String className : workspaceClasses) {
-            try {
-                Class<?> workspaceClass = XposedHelpers.findClass(className, lpparam.classLoader);
-
-                // Look for the performDoubleTap or onDoubleTap method
-                try {
-                    XposedHelpers.findAndHookMethod(workspaceClass, "performDoubleTap",
-                            new XC_MethodHook() {
-                                @Override
-                                protected void beforeHookedMethod(MethodHookParam param) {
-                                    XposedBridge.log(TAG + ": Double-tap intercepted on Workspace");
-                                    View workspace = (View) param.thisObject;
-                                    PrivateSpaceController.getInstance().onDoubleTap(workspace.getContext());
-                                    param.setResult(null); // Consume the event
-                                }
-                            });
-                    XposedBridge.log(TAG + ": Hooked performDoubleTap on " + className);
-                    return;
-                } catch (NoSuchMethodError ignored) {
-                }
-
-                break;
-            } catch (XposedHelpers.ClassNotFoundError ignored) {
-            }
-        }
-    }
-
-    private void hookLauncherDoubleTap(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Primary hook: WorkspaceTouchListener.onDoubleTap(MotionEvent)
-        // Confirmed via dexdump on device:
+        // Hook WorkspaceTouchListener.onDoubleTap — confirmed via dexdump:
         //   Class: com.android.launcher3.touch.WorkspaceTouchListener
         //   Method: onDoubleTap(MotionEvent) -> boolean, PUBLIC FINAL
-        //   Field: mLauncher type Launcher (extends Activity extends Context)
+        //   Field: mLauncher (type Launcher extends Activity extends Context)
+        hookWorkspaceTouchListenerDoubleTap(lpparam);
+    }
+
+    private void hookWorkspaceTouchListenerDoubleTap(XC_LoadPackage.LoadPackageParam lpparam) {
         String[] touchListenerClasses = {
                 "com.android.launcher3.touch.WorkspaceTouchListener",
                 "com.google.android.apps.nexuslauncher.touch.WorkspaceTouchListener"
@@ -224,43 +178,36 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Class<?> listenerClass = XposedHelpers.findClass(className, lpparam.classLoader);
 
-                // Hook onDoubleTap from GestureDetector.OnDoubleTapListener
-                try {
-                    XposedHelpers.findAndHookMethod(listenerClass, "onDoubleTap",
-                            android.view.MotionEvent.class,
-                            new XC_MethodHook() {
-                                @Override
-                                protected void beforeHookedMethod(MethodHookParam param) {
-                                    XposedBridge.log(TAG + ": Double-tap intercepted on TouchListener");
-                                    try {
-                                        // mLauncher is type Launcher which extends Activity extends Context
-                                        Object launcher = XposedHelpers.getObjectField(param.thisObject, "mLauncher");
-                                        android.content.Context ctx = (android.content.Context) launcher;
-                                        PrivateSpaceController.getInstance().onDoubleTap(ctx);
-                                    } catch (Exception e) {
-                                        XposedBridge.log(TAG + ": Could not get launcher context: " + e.getMessage());
-                                    }
-                                    param.setResult(true); // Consume the event
+                XposedHelpers.findAndHookMethod(listenerClass, "onDoubleTap",
+                        android.view.MotionEvent.class,
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                XposedBridge.log(TAG + ": Double-tap intercepted");
+                                try {
+                                    Object launcher = XposedHelpers.getObjectField(
+                                            param.thisObject, "mLauncher");
+                                    Context ctx = (Context) launcher;
+                                    unlockPrivateSpace(ctx);
+                                } catch (Exception e) {
+                                    XposedBridge.log(TAG + ": Double-tap handler error: "
+                                            + e.getMessage());
                                 }
-                            });
-                    XposedBridge.log(TAG + ": Hooked onDoubleTap on " + className);
-                    return;
-                } catch (NoSuchMethodError ignored) {
-                }
-
-            } catch (XposedHelpers.ClassNotFoundError ignored) {
+                                param.setResult(true); // Consume the event
+                            }
+                        });
+                XposedBridge.log(TAG + ": Hooked onDoubleTap on " + className);
+                return;
+            } catch (XposedHelpers.ClassNotFoundError | NoSuchMethodError ignored) {
             }
         }
 
-        // Final fallback: hook the GestureDetector.SimpleOnGestureListener onDoubleTap
-        // within any launcher-package class
-        XposedBridge.log(TAG + ": Using GestureDetector global hook fallback");
+        // Fallback: GestureDetector global hook filtered to workspace classes
+        XposedBridge.log(TAG + ": Primary hook failed, trying GestureDetector fallback");
         hookGestureDetectorFallback(lpparam);
     }
 
     private void hookGestureDetectorFallback(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Hook GestureDetector to intercept double-taps at the framework level
-        // but only within the Pixel Launcher process
         try {
             XposedHelpers.findAndHookMethod(
                     "android.view.GestureDetector$SimpleOnGestureListener",
@@ -270,20 +217,19 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            // Only intercept if we're in the launcher's Workspace context
                             String callerClass = param.thisObject.getClass().getName();
-                            if (callerClass.contains("Workspace") || callerClass.contains("workspace")
-                                    || callerClass.contains("DragLayer") || callerClass.contains("Launcher")) {
-                                XposedBridge.log(TAG + ": GestureDetector double-tap from " + callerClass);
-
+                            if (callerClass.contains("Workspace")
+                                    || callerClass.contains("DragLayer")) {
+                                XposedBridge.log(TAG + ": Fallback double-tap from "
+                                        + callerClass);
                                 try {
-                                    // Try getting context from the view hierarchy
                                     if (param.thisObject instanceof View) {
-                                        PrivateSpaceController.getInstance()
-                                                .onDoubleTap(((View) param.thisObject).getContext());
+                                        unlockPrivateSpace(
+                                                ((View) param.thisObject).getContext());
                                     }
                                 } catch (Exception e) {
-                                    XposedBridge.log(TAG + ": Fallback context retrieval failed: " + e.getMessage());
+                                    XposedBridge.log(TAG + ": Fallback error: "
+                                            + e.getMessage());
                                 }
                                 param.setResult(true);
                             }
@@ -291,7 +237,114 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
             );
         } catch (Exception e) {
-            XposedBridge.log(TAG + ": GestureDetector fallback hook failed: " + e.getMessage());
+            XposedBridge.log(TAG + ": GestureDetector fallback failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Unlock Private Space directly from within the Pixel Launcher process.
+     *
+     * This works because:
+     * - We're running inside Pixel Launcher (foreground default launcher)
+     * - The PrivateSpaceMod APK is installed as priv-app with MANAGE_USERS
+     *   and INTERACT_ACROSS_USERS permissions
+     * - requestQuietModeEnabled requires the caller to be foreground default
+     *   launcher OR have MANAGE_USERS — we have both
+     *
+     * Same logic as com.example.privatespaceunlock.MainActivity but inline.
+     */
+    private void unlockPrivateSpace(Context context) {
+        if (isUnlocking) {
+            XposedBridge.log(TAG + ": Already unlocking, skipping");
+            return;
+        }
+        isUnlocking = true;
+
+        new Thread(() -> {
+            try {
+                XposedBridge.log(TAG + ": Starting Private Space unlock");
+
+                // Step 1: Start user 10
+                Process p = Runtime.getRuntime().exec("su -c am start-user "
+                        + PRIVATE_SPACE_USER_ID);
+                p.waitFor();
+                XposedBridge.log(TAG + ": am start-user completed");
+
+                Thread.sleep(500);
+
+                // Step 2: Call requestQuietModeEnabled(false, UserHandle.of(10))
+                // Must run on main thread for foreground check
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    try {
+                        UserManager um = (UserManager) context.getSystemService(
+                                Context.USER_SERVICE);
+                        if (um == null) {
+                            XposedBridge.log(TAG + ": UserManager is null");
+                            isUnlocking = false;
+                            return;
+                        }
+
+                        Method ofMethod = UserHandle.class.getDeclaredMethod(
+                                "of", int.class);
+                        UserHandle psUser = (UserHandle) ofMethod.invoke(
+                                null, PRIVATE_SPACE_USER_ID);
+
+                        boolean result = um.requestQuietModeEnabled(false, psUser);
+                        XposedBridge.log(TAG + ": requestQuietModeEnabled(false) = "
+                                + result);
+
+                    } catch (SecurityException se) {
+                        // Fallback: if permission denied from launcher process,
+                        // try via su shell command
+                        XposedBridge.log(TAG + ": SecurityException, trying su fallback: "
+                                + se.getMessage());
+                        unlockViaSu(context);
+                    } catch (Exception e) {
+                        XposedBridge.log(TAG + ": Unlock error: " + e.getMessage());
+                        unlockViaSu(context);
+                    } finally {
+                        isUnlocking = false;
+                    }
+                });
+
+            } catch (Exception e) {
+                XposedBridge.log(TAG + ": Thread error: " + e.getMessage());
+                isUnlocking = false;
+            }
+        }).start();
+    }
+
+    /**
+     * Fallback: launch the unlock via su + am start of our own priv-app activity.
+     * The PrivateSpaceMod APK includes a MainActivity that does the unlock.
+     */
+    private void unlockViaSu(Context context) {
+        try {
+            XposedBridge.log(TAG + ": Trying su am start fallback");
+
+            // Try launching our own module's activity first
+            try {
+                android.content.Intent intent = new android.content.Intent();
+                intent.setComponent(new android.content.ComponentName(
+                        "com.fdavids77.privatespacmod",
+                        "com.fdavids77.privatespacmod.UnlockActivity"));
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(intent);
+                XposedBridge.log(TAG + ": Launched UnlockActivity");
+                return;
+            } catch (Exception e) {
+                XposedBridge.log(TAG + ": UnlockActivity not found: " + e.getMessage());
+            }
+
+            // Final fallback: use am to broadcast/simulate
+            Runtime.getRuntime().exec(new String[]{
+                    "su", "-c",
+                    "am start-user 10"
+            });
+            XposedBridge.log(TAG + ": Executed am start-user 10 via su");
+
+        } catch (Exception e) {
+            XposedBridge.log(TAG + ": Su fallback failed: " + e.getMessage());
         }
     }
 }
