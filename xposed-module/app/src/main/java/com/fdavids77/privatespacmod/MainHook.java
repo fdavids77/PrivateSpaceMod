@@ -171,7 +171,7 @@ public class MainHook implements IXposedHookLoadPackage {
         // Approach 1: Hook the Workspace class's gesture handler
         hookWorkspaceDoubleTap(lpparam);
 
-        // Approach 2: Hook the launcher Activity's dispatchTouchEvent as fallback
+        // Approach 2: Hook the WorkspaceTouchListener (confirmed on device)
         hookLauncherDoubleTap(lpparam);
     }
 
@@ -210,8 +210,11 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void hookLauncherDoubleTap(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Fallback: Hook the DoubleTapToSleep / DoubleTapAction handler if present
-        // Pixel Launcher uses com.android.launcher3.touch.WorkspaceTouchListener
+        // Primary hook: WorkspaceTouchListener.onDoubleTap(MotionEvent)
+        // Confirmed via dexdump on device:
+        //   Class: com.android.launcher3.touch.WorkspaceTouchListener
+        //   Method: onDoubleTap(MotionEvent) -> boolean, PUBLIC FINAL
+        //   Field: mLauncher type Launcher (extends Activity extends Context)
         String[] touchListenerClasses = {
                 "com.android.launcher3.touch.WorkspaceTouchListener",
                 "com.google.android.apps.nexuslauncher.touch.WorkspaceTouchListener"
@@ -229,20 +232,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) {
                                     XposedBridge.log(TAG + ": Double-tap intercepted on TouchListener");
-                                    // Get context from the listener's launcher reference
                                     try {
+                                        // mLauncher is type Launcher which extends Activity extends Context
                                         Object launcher = XposedHelpers.getObjectField(param.thisObject, "mLauncher");
-                                        if (launcher instanceof android.content.Context) {
-                                            PrivateSpaceController.getInstance()
-                                                    .onDoubleTap((android.content.Context) launcher);
-                                        } else {
-                                            // Try mActivity or similar
-                                            Object activity = XposedHelpers.callMethod(launcher, "getApplicationContext");
-                                            if (activity instanceof android.content.Context) {
-                                                PrivateSpaceController.getInstance()
-                                                        .onDoubleTap((android.content.Context) activity);
-                                            }
-                                        }
+                                        android.content.Context ctx = (android.content.Context) launcher;
+                                        PrivateSpaceController.getInstance().onDoubleTap(ctx);
                                     } catch (Exception e) {
                                         XposedBridge.log(TAG + ": Could not get launcher context: " + e.getMessage());
                                     }
@@ -274,18 +268,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     "onDoubleTap",
                     android.view.MotionEvent.class,
                     new XC_MethodHook() {
-                        private boolean isLauncherGesture = false;
-
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             // Only intercept if we're in the launcher's Workspace context
                             String callerClass = param.thisObject.getClass().getName();
                             if (callerClass.contains("Workspace") || callerClass.contains("workspace")
                                     || callerClass.contains("DragLayer") || callerClass.contains("Launcher")) {
-                                isLauncherGesture = true;
                                 XposedBridge.log(TAG + ": GestureDetector double-tap from " + callerClass);
 
-                                android.view.MotionEvent event = (android.view.MotionEvent) param.args[0];
                                 try {
                                     // Try getting context from the view hierarchy
                                     if (param.thisObject instanceof View) {
