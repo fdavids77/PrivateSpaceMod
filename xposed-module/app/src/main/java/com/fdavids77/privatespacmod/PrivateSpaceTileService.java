@@ -1,25 +1,18 @@
 package com.fdavids77.privatespacmod;
 
-import android.content.Context;
-import android.os.UserHandle;
-import android.os.UserManager;
+import android.content.ComponentName;
+import android.content.Intent;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
 import android.util.Log;
 
-import java.lang.reflect.Method;
-
 /**
  * Quick Settings Tile for Private Space unlock.
- * Backup trigger method — double-tap home screen is primary.
- *
- * Tap: Unlock Private Space + show app picker overlay.
- * Requires MANAGE_USERS + INTERACT_ACROSS_USERS permissions (from Magisk priv-app install).
+ * Tapping the tile launches UnlockActivity which handles the unlock.
  */
 public class PrivateSpaceTileService extends TileService {
 
     private static final String TAG = "PSMod";
-    private static final int PRIVATE_SPACE_USER_ID = 10;
 
     @Override
     public void onStartListening() {
@@ -32,33 +25,19 @@ public class PrivateSpaceTileService extends TileService {
         super.onClick();
 
         try {
-            Log.d(TAG, "QS Tile clicked — unlocking Private Space");
+            Log.d(TAG, "QS Tile clicked — launching UnlockActivity");
 
-            // Start user 10
-            Runtime.getRuntime().exec("su -c am start-user " + PRIVATE_SPACE_USER_ID);
-            Thread.sleep(500);
+            Intent intent = new Intent();
+            intent.setComponent(new ComponentName(
+                    "com.fdavids77.privatespacmod",
+                    "com.fdavids77.privatespacmod.UnlockActivity"));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivityAndCollapse(intent);
 
-            UserManager userManager = (UserManager) getSystemService(Context.USER_SERVICE);
-            if (userManager == null) {
-                Log.e(TAG, "UserManager is null");
-                return;
-            }
-
-            Method ofMethod = UserHandle.class.getDeclaredMethod("of", int.class);
-            UserHandle privateSpaceUser = (UserHandle) ofMethod.invoke(null, PRIVATE_SPACE_USER_ID);
-
-            userManager.requestQuietModeEnabled(false, privateSpaceUser);
-            Log.d(TAG, "Private Space unlocked via QS tile");
-
-            updateTileState();
-
-            // Launch app picker overlay after unlock
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                PrivateSpaceController.getInstance().onDoubleTap(getApplicationContext());
-            }, 800);
+            Log.d(TAG, "UnlockActivity launched from QS tile");
 
         } catch (Exception e) {
-            Log.e(TAG, "Error unlocking Private Space via tile", e);
+            Log.e(TAG, "Error launching from QS tile", e);
         }
     }
 
