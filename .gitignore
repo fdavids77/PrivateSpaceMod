@@ -1,0 +1,9 @@
+*.iml
+.gradle/
+.idea/
+build/
+local.properties
+*.apk
+!magisk-module/system/priv-app/PrivateSpaceMod/PrivateSpaceMod.apk
+*.zip
+.DS_Store

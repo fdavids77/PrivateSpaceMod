@@ -1,0 +1,46 @@
+#!/sbin/sh
+
+##########################################################################################
+#
+# Magisk Module Installer Script
+#
+##########################################################################################
+
+TMPDIR=/dev/tmp
+PERSISTDIR=/sbin/.magisk/mirror/persist
+
+umask 022
+
+[ -f /data/adb/magisk/util_functions.sh ] && . /data/adb/magisk/util_functions.sh
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+setup_flashable
+
+set_perm() {
+    chown $2:$3 $1 || true
+    chmod $4 $1 || true
+    chcon u:object_r:system_file:s0 $1 2>/dev/null || true
+}
+
+set_perm_recursive() {
+    find $1 -type d 2>/dev/null | while read dir; do
+        set_perm $dir $2 $3 $4
+    done
+    find $1 -type f -o -type l 2>/dev/null | while read file; do
+        set_perm $file $2 $3 $5
+    done
+}
+
+# Default permissions
+MODPATH=${MODPATH:-/data/adb/modules/privatespacmod}
+mkdir -p $MODPATH
+
+# Run customize.sh
+unzip -o "$ZIPFILE" customize.sh -d $TMPDIR >/dev/null 2>&1
+if [ -f "$TMPDIR/customize.sh" ]; then
+    . "$TMPDIR/customize.sh"
+fi

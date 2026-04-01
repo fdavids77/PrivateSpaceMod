@@ -1,0 +1,111 @@
+name: Build PrivateSpaceMod
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build LSPosed module APK
+        working-directory: xposed-module
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+          # Generate wrapper if missing (Termux push may not include it)
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.7
+          fi
+          ./gradlew assembleRelease
+
+      - name: Package Magisk module ZIP
+        run: |
+          set -euo pipefail
+
+          echo "==> Copying built APK into Magisk module structure"
+          APK_PATH=$(find xposed-module/app/build/outputs/apk/release -name '*.apk' | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "ERROR: No APK found in build output"
+            exit 1
+          fi
+
+          mkdir -p magisk-module/system/priv-app/PrivateSpaceMod
+          cp "$APK_PATH" magisk-module/system/priv-app/PrivateSpaceMod/PrivateSpaceMod.apk
+          echo "APK copied: $(ls -lh magisk-module/system/priv-app/PrivateSpaceMod/PrivateSpaceMod.apk)"
+
+          echo "==> Building flashable ZIP"
+          cd magisk-module
+          # Ensure correct permissions in ZIP
+          find . -name '*.sh' -exec chmod 755 {} \;
+          zip -r ../PrivateSpaceMod-v2.0.zip . \
+            -x '*.git*' \
+            -x '*.DS_Store'
+          cd ..
+
+          echo "==> Verifying ZIP contents"
+          unzip -l PrivateSpaceMod-v2.0.zip
+          echo "ZIP size: $(ls -lh PrivateSpaceMod-v2.0.zip | awk '{print $5}')"
+
+      - name: Upload Magisk module ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrivateSpaceMod-Magisk
+          path: PrivateSpaceMod-v2.0.zip
+
+      - name: Upload APK (standalone)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrivateSpaceMod-APK
+          path: xposed-module/app/build/outputs/apk/release/*.apk
+
+      # Auto-create GitHub Release on tag push
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            PrivateSpaceMod-v2.0.zip
+          body: |
+            ## PrivateSpaceMod ${{ github.ref_name }}
+
+            Unified Private Space module for rooted Pixel devices.
+
+            ### Features
+            - **Double-tap home screen** → Unlock Private Space instantly
+            - **Mini app-picker overlay** → Launch Private Space apps from a floating pill
+            - **Label & icon hider** → Hides "Private" label + lock icon from Pixel Launcher
+            - **QS tile** → Backup unlock trigger from notification shade
+
+            ### Requirements
+            - Rooted Android 15/16 (Magisk)
+            - LSPosed (JingMatrix/Vector fork recommended for Android 16)
+            - Pixel Launcher as default launcher
+
+            ### Installation
+            1. Flash `PrivateSpaceMod-v2.0.zip` via Magisk Manager
+            2. Reboot
+            3. Enable module in LSPosed Manager → Scope: **Pixel Launcher**
+            4. Reboot again
+            5. Double-tap home screen to test!
+
+            ### Replaces
+            - PSLabelHider (label/icon hiding)
+            - PrivateSpaceUnlock (QS tile unlock)
+          generate_release_notes: true
