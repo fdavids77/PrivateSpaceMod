@@ -53,7 +53,7 @@ public class PrivateSpaceTileService extends TileService {
             updateTileState();
 
             // Launch app picker overlay after unlock
-            getMainThreadHandler().postDelayed(() -> {
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
                 PrivateSpaceController.getInstance().onDoubleTap(getApplicationContext());
             }, 800);
 
