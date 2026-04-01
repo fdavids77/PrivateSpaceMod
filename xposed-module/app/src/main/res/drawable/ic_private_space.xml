@@ -3,7 +3,7 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24"
-    android:tint="?attr/colorControlNormal">
+    android:tint="#FFFFFF">
     <!-- Lock open icon for Private Space tile -->
     <path
         android:fillColor="#FFFFFF"
