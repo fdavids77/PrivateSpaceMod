@@ -18,13 +18,20 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Private Space: double-tap unlock, label hider, app picker" />
+            android:value="Private Space: double-tap unlock, label hider, QS tile" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
         <meta-data
             android:name="xposedscope"
             android:value="com.google.android.apps.nexuslauncher" />
+
+        <!-- Unlock Activity (called by double-tap hook or directly) -->
+        <activity
+            android:name=".UnlockActivity"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:excludeFromRecents="true"
+            android:exported="true" />
 
         <!-- Quick Settings Tile (backup unlock trigger) -->
         <service
