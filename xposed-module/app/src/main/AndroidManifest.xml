@@ -18,13 +18,17 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Private Space: double-tap unlock, label hider, QS tile" />
+            android:value="Private Space: double-tap unlock, label hider, WA clone no-quiet-mode" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
+        <!--
+            Scope: android = system_server (for WA clone quiet-mode block)
+                   com.google.android.apps.nexuslauncher = Pixel Launcher (label hider + double-tap)
+        -->
         <meta-data
             android:name="xposedscope"
-            android:value="com.google.android.apps.nexuslauncher" />
+            android:value="android;com.google.android.apps.nexuslauncher" />
 
         <!-- Unlock Activity (called by double-tap hook or directly) -->
         <activity

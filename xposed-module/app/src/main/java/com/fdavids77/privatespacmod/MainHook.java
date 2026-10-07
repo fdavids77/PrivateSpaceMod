@@ -18,29 +18,140 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v2.0 — Unified LSPosed module
+ * PrivateSpaceMod v2.1 — Unified LSPosed module
  *
  * Single module:
  *   1. Hide "Private" label + lock icon (PSLabelHider v1.15 logic)
  *   2. Double-tap home screen → unlock Private Space directly
+ *   3. [NEW] Block UserManagerService.requestQuietModeEnabled() for WA clone
+ *      profiles (userIds 11–15) so the OS can never auto-pause them.
+ *      Runs in system_server (android process).
  *
- * Target: Pixel 9 Pro XL, Android 15/16, Magisk + LSPosed (JingMatrix/Vector)
+ * Target: Pixel 9, Android 15/16/17, Magisk + LSPosed (JingMatrix/Vector)
  * Author: fdavids77
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "PSMod";
     private static final String LAUNCHER_PKG = "com.google.android.apps.nexuslauncher";
+    private static final String SYSTEM_SERVER_PKG = "android";
+
+    // WA clone profile user IDs to protect from auto-pause
+    private static final int WA_USER_MIN = 11;
+    private static final int WA_USER_MAX = 15;
+
     private static final int PRIVATE_SPACE_USER_ID = 10;
     private static boolean isUnlocking = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!lpparam.packageName.equals(LAUNCHER_PKG)) return;
 
-        XposedBridge.log(TAG + ": Hooking Pixel Launcher");
-        hookLabelHider(lpparam);
-        hookDoubleTapGesture(lpparam);
+        // ── system_server: block quiet-mode re-enablement for clone users ──
+        if (lpparam.packageName.equals(SYSTEM_SERVER_PKG)) {
+            hookNoQuietMode(lpparam);
+            return;
+        }
+
+        // ── Pixel Launcher: label hider + double-tap unlock ──
+        if (lpparam.packageName.equals(LAUNCHER_PKG)) {
+            XposedBridge.log(TAG + ": Hooking Pixel Launcher");
+            hookLabelHider(lpparam);
+            hookDoubleTapGesture(lpparam);
+        }
+    }
+
+    // =========================================================================
+    // PART 3 (NEW): No-Quiet-Mode hook — system_server / UserManagerService
+    // =========================================================================
+
+    /**
+     * Hook UserManagerService.requestQuietModeEnabled() running inside
+     * system_server.  If the OS tries to enable quiet mode (pause) on any of
+     * the WA clone profiles (users 11-15) we simply return false and skip the
+     * real method — the profiles stay running.
+     *
+     * Method signature on Android 13-17:
+     *   boolean requestQuietModeEnabled(String callingPackage, boolean enableQuietMode,
+     *                                   int userId, IntentSender target, int flags)
+     */
+    private void hookNoQuietMode(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Class<?> ums = XposedHelpers.findClass(
+                    "com.android.server.pm.UserManagerService",
+                    lpparam.classLoader);
+
+            // Hook the 5-arg form (present on Android 13+)
+            XposedHelpers.findAndHookMethod(
+                    ums,
+                    "requestQuietModeEnabled",
+                    String.class,                        // callingPackage
+                    boolean.class,                       // enableQuietMode
+                    int.class,                           // userId
+                    android.content.IntentSender.class,  // target
+                    int.class,                           // flags
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boolean enable = (boolean) param.args[1];
+                            int userId   = (int)    param.args[2];
+
+                            if (enable && userId >= WA_USER_MIN && userId <= WA_USER_MAX) {
+                                XposedBridge.log(TAG + ": BLOCKED requestQuietModeEnabled("
+                                        + "enable=true, userId=" + userId + ") from "
+                                        + param.args[0]);
+                                // Return false → caller sees "request denied"
+                                param.setResult(false);
+                            }
+                        }
+                    }
+            );
+            XposedBridge.log(TAG + ": NoQuietMode hook installed for userIds "
+                    + WA_USER_MIN + "-" + WA_USER_MAX);
+
+        } catch (XposedHelpers.ClassNotFoundError e) {
+            XposedBridge.log(TAG + ": UserManagerService class not found: " + e.getMessage());
+        } catch (NoSuchMethodError e) {
+            // Android version may have a different signature — try 4-arg form (Android 10-12)
+            tryHookNoQuietModeLegacy(lpparam);
+        }
+    }
+
+    /**
+     * Fallback: 4-arg form used on older Android versions (no IntentSender param).
+     *   boolean requestQuietModeEnabled(String callingPackage, boolean enableQuietMode,
+     *                                   int userId, int flags)
+     */
+    private void tryHookNoQuietModeLegacy(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Class<?> ums = XposedHelpers.findClass(
+                    "com.android.server.pm.UserManagerService",
+                    lpparam.classLoader);
+
+            XposedHelpers.findAndHookMethod(
+                    ums,
+                    "requestQuietModeEnabled",
+                    String.class,
+                    boolean.class,
+                    int.class,
+                    int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boolean enable = (boolean) param.args[1];
+                            int userId   = (int)    param.args[2];
+
+                            if (enable && userId >= WA_USER_MIN && userId <= WA_USER_MAX) {
+                                XposedBridge.log(TAG + ": BLOCKED (legacy) requestQuietModeEnabled("
+                                        + "enable=true, userId=" + userId + ")");
+                                param.setResult(false);
+                            }
+                        }
+                    }
+            );
+            XposedBridge.log(TAG + ": NoQuietMode hook (legacy 4-arg) installed");
+        } catch (Exception e) {
+            XposedBridge.log(TAG + ": NoQuietMode legacy hook also failed: " + e.getMessage());
+        }
     }
 
     // =========================================================================
@@ -84,9 +195,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
         );
 
-        // Hook PrivateProfileManager methods for deep hiding
         hookPrivateProfileManager(lpparam);
-
         XposedBridge.log(TAG + ": Label hider hooks installed");
     }
 
@@ -99,7 +208,6 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void hookPrivateProfileManager(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Try multiple class names across Android 15/16 Pixel Launcher versions
         String[] classNames = {
                 "com.android.launcher3.model.data.PrivateProfileManager",
                 "com.android.launcher3.pm.PrivateProfileManager",
@@ -110,7 +218,6 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
 
-                // Hook updateView — force hide lock-related views
                 try {
                     XposedHelpers.findAndHookMethod(clazz, "updateView",
                             new XC_MethodHook() {
@@ -122,7 +229,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 } catch (NoSuchMethodError ignored) {
                 }
 
-                // Hook bind — same treatment
                 try {
                     XposedHelpers.findAndHookMethod(clazz, "bind",
                             new XC_MethodHook() {
@@ -135,7 +241,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
 
                 XposedBridge.log(TAG + ": Hooked PrivateProfileManager: " + className);
-                break; // Found the right class
+                break;
             } catch (XposedHelpers.ClassNotFoundError ignored) {
             }
         }
@@ -143,16 +249,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void hidePrivateSpaceSettingsViews(Object manager) {
         try {
-            // Navigate from mPrivateSpaceSettingsButton to parent container
             Object settingsButton = XposedHelpers.getObjectField(manager, "mPrivateSpaceSettingsButton");
             if (settingsButton instanceof View) {
                 View btn = (View) settingsButton;
                 btn.setVisibility(View.GONE);
-
-                // Walk up to hide the parent group too
                 if (btn.getParent() instanceof View) {
-                    View parent = (View) btn.getParent();
-                    parent.setVisibility(View.GONE);
+                    ((View) btn.getParent()).setVisibility(View.GONE);
                 }
             }
         } catch (NoSuchFieldError | ClassCastException e) {

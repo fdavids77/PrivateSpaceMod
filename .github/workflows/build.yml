@@ -69,20 +69,20 @@ jobs:
           cd magisk-module
           # Ensure correct permissions in ZIP
           find . -name '*.sh' -exec chmod 755 {} \;
-          zip -r ../PrivateSpaceMod-v2.0.zip . \
+          zip -r ../PrivateSpaceMod-v2.1.zip . \
             -x '*.git*' \
             -x '*.DS_Store'
           cd ..
 
           echo "==> Verifying ZIP contents"
-          unzip -l PrivateSpaceMod-v2.0.zip
-          echo "ZIP size: $(ls -lh PrivateSpaceMod-v2.0.zip | awk '{print $5}')"
+          unzip -l PrivateSpaceMod-v2.1.zip
+          echo "ZIP size: $(ls -lh PrivateSpaceMod-v2.1.zip | awk '{print $5}')"
 
       - name: Upload Magisk module ZIP
         uses: actions/upload-artifact@v4
         with:
           name: PrivateSpaceMod-Magisk
-          path: PrivateSpaceMod-v2.0.zip
+          path: PrivateSpaceMod-v2.1.zip
 
       - name: Upload APK (standalone)
         uses: actions/upload-artifact@v4
@@ -96,7 +96,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            PrivateSpaceMod-v2.0.zip
+            PrivateSpaceMod-v2.1.zip
           body: |
             ## PrivateSpaceMod ${{ github.ref_name }}
 
@@ -104,23 +104,26 @@ jobs:
 
             ### Features
             - **Double-tap home screen** → Unlock Private Space instantly
-            - **Mini app-picker overlay** → Launch Private Space apps from a floating pill
             - **Label & icon hider** → Hides "Private" label + lock icon from Pixel Launcher
             - **QS tile** → Backup unlock trigger from notification shade
+            - **No-Quiet-Mode hook** *(NEW in v2.1)* → Permanently blocks Android from
+              auto-pausing managed profiles (userIds 11–15). Fixes the "Unpause work apps"
+              popup when opening WhatsApp clone profiles in Private Space.
 
             ### Requirements
-            - Rooted Android 15/16 (Magisk)
-            - LSPosed (JingMatrix/Vector fork recommended for Android 16)
+            - Rooted Android 15–17 (Magisk)
+            - LSPosed (JingMatrix/Vector fork recommended for Android 16/17)
             - Pixel Launcher as default launcher
 
             ### Installation
-            1. Flash `PrivateSpaceMod-v2.0.zip` via Magisk Manager
+            1. Flash `PrivateSpaceMod-v2.1.zip` via Magisk Manager
             2. Reboot
-            3. Enable module in LSPosed Manager → Scope: **Pixel Launcher**
-            4. Reboot again
-            5. Double-tap home screen to test!
+            3. Open LSPosed Manager → Modules → PrivateSpaceMod → Enable
+            4. Set scope to: **Pixel Launcher** AND **System Framework (android)**
+            5. Reboot again
 
             ### Replaces
             - PSLabelHider (label/icon hiding)
             - PrivateSpaceUnlock (QS tile unlock)
+            - wa-quiet-daemon.sh (quiet mode polling daemon — no longer needed)
           generate_release_notes: true
