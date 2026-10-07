@@ -146,15 +146,29 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             // ── Resolve UserManagerService.setQuietModeEnabled ──
-            // Call this before startUser to suppress "unpause work apps" prompt
+            // Call this before startUser to suppress "unpause work apps" prompt.
+            // Android 17 signature: setQuietModeEnabled(int, boolean, IntentSender, String)
+            // Older signature:      setQuietModeEnabled(int, boolean)
+            // Try the 4-arg form first; fall back to 2-arg for older builds.
             try {
                 Class<?> umsClass = XposedHelpers.findClassIfExists(
                         "com.android.server.pm.UserManagerService", lpparam.classLoader);
                 if (umsClass != null) {
-                    sSetQuietModeMethod = umsClass.getDeclaredMethod(
-                            "setQuietModeEnabled", int.class, boolean.class);
-                    sSetQuietModeMethod.setAccessible(true);
-                    XposedBridge.log(TAG + ": Resolved setQuietModeEnabled(int,bool)");
+                    // Try 4-arg first (Android 17+)
+                    try {
+                        sSetQuietModeMethod = umsClass.getDeclaredMethod(
+                                "setQuietModeEnabled",
+                                int.class, boolean.class,
+                                android.content.IntentSender.class, String.class);
+                        sSetQuietModeMethod.setAccessible(true);
+                        XposedBridge.log(TAG + ": Resolved setQuietModeEnabled(int,bool,IntentSender,String)");
+                    } catch (NoSuchMethodException e4) {
+                        // Fall back to 2-arg (Android 14/15)
+                        sSetQuietModeMethod = umsClass.getDeclaredMethod(
+                                "setQuietModeEnabled", int.class, boolean.class);
+                        sSetQuietModeMethod.setAccessible(true);
+                        XposedBridge.log(TAG + ": Resolved setQuietModeEnabled(int,bool) [2-arg fallback]");
+                    }
                 } else {
                     XposedBridge.log(TAG + ": UserManagerService class not found");
                 }
@@ -269,6 +283,9 @@ public class MainHook implements IXposedHookLoadPackage {
     /**
      * Start clone users 11-15 via the pre-resolved startUser Method.
      * 1.5 s delay gives system_server time to finish unlocking user 10 first.
+     * Calls setQuietModeEnabled(uid, false, null, null) before each startUser
+     * to suppress the "unpause work apps" dialog Android shows when a profile
+     * is started from quiet state.
      */
     private static void startCloneUsers(Object ucInstance) {
         if (sStartUserMethod == null) {
@@ -279,12 +296,11 @@ public class MainHook implements IXposedHookLoadPackage {
             try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
-                    // Disable quiet mode first so Android doesn't show "unpause work apps" prompt
+                    // Disable quiet mode before startUser to suppress "unpause work apps" prompt.
+                    // Android 17: setQuietModeEnabled(int, boolean, IntentSender, String)
+                    // Older:      setQuietModeEnabled(int, boolean)
                     if (sSetQuietModeMethod != null) {
                         try {
-                            // setQuietModeEnabled needs a UserManagerService instance, not UC;
-                            // call via IUserManager binder instead via UserManager API.
-                            // Simplest: call via reflection on UserManagerService singleton.
                             Class<?> umsClass = sSetQuietModeMethod.getDeclaringClass();
                             java.lang.reflect.Method getInstanceMethod = null;
                             try {
@@ -293,8 +309,17 @@ public class MainHook implements IXposedHookLoadPackage {
                             } catch (NoSuchMethodException ignored) {}
                             if (getInstanceMethod != null) {
                                 Object umsInstance = getInstanceMethod.invoke(null);
-                                sSetQuietModeMethod.invoke(umsInstance, uid, false);
+                                int paramCount = sSetQuietModeMethod.getParameterCount();
+                                if (paramCount == 4) {
+                                    // Android 17+: (int, boolean, IntentSender, String)
+                                    sSetQuietModeMethod.invoke(umsInstance, uid, false, null, null);
+                                } else {
+                                    // Older: (int, boolean)
+                                    sSetQuietModeMethod.invoke(umsInstance, uid, false);
+                                }
                                 XposedBridge.log(TAG + ": quietMode disabled for user " + uid);
+                            } else {
+                                XposedBridge.log(TAG + ": UMS getInstance not found for user " + uid);
                             }
                         } catch (Exception qe) {
                             XposedBridge.log(TAG + ": quietMode disable skipped for " + uid + ": " + qe.getMessage());
