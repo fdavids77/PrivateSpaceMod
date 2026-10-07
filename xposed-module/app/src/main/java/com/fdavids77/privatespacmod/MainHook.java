@@ -108,6 +108,7 @@ public class MainHook implements IXposedHookLoadPackage {
     // Resolved once at hook-install time; used by stop/startCloneUsers
     private static java.lang.reflect.Method sStopUserMethod = null;
     private static java.lang.reflect.Method sStartUserMethod = null;
+    private static java.lang.reflect.Method sSetQuietModeMethod = null;
 
     private void hookPrivateSpaceLockUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
@@ -142,6 +143,23 @@ public class MainHook implements IXposedHookLoadPackage {
                 } catch (NoSuchMethodException e2) {
                     XposedBridge.log(TAG + ": stopUser fallback not found: " + e2.getMessage());
                 }
+            }
+
+            // ── Resolve UserManagerService.setQuietModeEnabled ──
+            // Call this before startUser to suppress "unpause work apps" prompt
+            try {
+                Class<?> umsClass = XposedHelpers.findClassIfExists(
+                        "com.android.server.pm.UserManagerService", lpparam.classLoader);
+                if (umsClass != null) {
+                    sSetQuietModeMethod = umsClass.getDeclaredMethod(
+                            "setQuietModeEnabled", int.class, boolean.class);
+                    sSetQuietModeMethod.setAccessible(true);
+                    XposedBridge.log(TAG + ": Resolved setQuietModeEnabled(int,bool)");
+                } else {
+                    XposedBridge.log(TAG + ": UserManagerService class not found");
+                }
+            } catch (NoSuchMethodException e) {
+                XposedBridge.log(TAG + ": setQuietModeEnabled not found: " + e.getMessage());
             }
 
             // ── Resolve startUser method via reflection ──
@@ -261,10 +279,32 @@ public class MainHook implements IXposedHookLoadPackage {
             try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
+                    // Disable quiet mode first so Android doesn't show "unpause work apps" prompt
+                    if (sSetQuietModeMethod != null) {
+                        try {
+                            // setQuietModeEnabled needs a UserManagerService instance, not UC;
+                            // call via IUserManager binder instead via UserManager API.
+                            // Simplest: call via reflection on UserManagerService singleton.
+                            Class<?> umsClass = sSetQuietModeMethod.getDeclaringClass();
+                            java.lang.reflect.Method getInstanceMethod = null;
+                            try {
+                                getInstanceMethod = umsClass.getDeclaredMethod("getInstance");
+                                getInstanceMethod.setAccessible(true);
+                            } catch (NoSuchMethodException ignored) {}
+                            if (getInstanceMethod != null) {
+                                Object umsInstance = getInstanceMethod.invoke(null);
+                                sSetQuietModeMethod.invoke(umsInstance, uid, false);
+                                XposedBridge.log(TAG + ": quietMode disabled for user " + uid);
+                            }
+                        } catch (Exception qe) {
+                            XposedBridge.log(TAG + ": quietMode disable skipped for " + uid + ": " + qe.getMessage());
+                        }
+                    }
+
                     int paramCount = sStartUserMethod.getParameterCount();
                     if (paramCount == 2 && sStartUserMethod.getParameterTypes()[1] == int.class) {
                         // startUser(int, int startMode)
-                        // UserManager.USER_START_MODE_BACKGROUND = 2 (not 0 — 0 is FOREGROUND)
+                        // UserManager.USER_START_MODE_BACKGROUND = 2
                         sStartUserMethod.invoke(ucInstance, uid, 2);
                     } else {
                         // startUser(int, boolean) — background = true
