@@ -19,7 +19,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v3.5 — Unified LSPosed module
+ * PrivateSpaceMod v3.6 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
@@ -71,6 +71,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // True while our own cascade-stop is running; lets stopSingleUserLU through
     private static volatile boolean sOurCascadeStopRunning = false;
+    // Count of compare() calls logged so far (for one-shot diagnostics)
+    private static volatile int sSortLogCount = 0;
     // True while PS is unlocked (user 10 has been maybeUnlockUser'd but not stopped)
     private static volatile boolean sPsUnlocked = false;
     // True while we are starting clone users — suppresses MANAGED_PROFILE_AVAILABLE
@@ -665,10 +667,16 @@ public class MainHook implements IXposedHookLoadPackage {
                                 Object a = param.args[0];
                                 Object b = param.args[1];
 
-                                // Prefer appTitle (set by launcher from PackageManager label),
-                                // fall back to title (ItemInfo base field).
                                 String labelA = getLabelString(a);
                                 String labelB = getLabelString(b);
+
+                                // Diagnostic: log first 5 comparisons so we can see
+                                // what field values are actually being compared.
+                                if (sSortLogCount < 5) {
+                                    sSortLogCount++;
+                                    XposedBridge.log(TAG + ": sortCompare[" + sSortLogCount
+                                            + "] labelA='" + labelA + "' labelB='" + labelB + "'");
+                                }
 
                                 Collator collator = Collator.getInstance();
                                 collator.setStrength(Collator.PRIMARY); // case/accent insensitive
@@ -691,23 +699,47 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * Extract a display label string from an AppInfo / ItemInfo object.
-     * Tries the appTitle field first (CharSequence set by the launcher from
-     * PackageManager), then falls back to title (base ItemInfo field).
-     * Returns an empty string if neither field yields a non-null value.
+     *
+     * Field search order (confirmed from Pixel Launcher dexdump, Android 17):
+     *   1. appTitle  — CharSequence on ItemInfo, set from PackageManager label
+     *   2. title     — CharSequence on ItemInfo base class (same value, set earlier)
+     *
+     * If both are null/empty we fall back to the package name from componentName
+     * so the sort is still deterministic rather than leaving everything as "".
      */
     private static String getLabelString(Object item) {
         if (item == null) return "";
         CharSequence cs = null;
+
+        // Try appTitle first
         try {
             Object f = XposedHelpers.getObjectField(item, "appTitle");
-            if (f instanceof CharSequence) cs = (CharSequence) f;
+            if (f instanceof CharSequence && ((CharSequence) f).length() > 0)
+                cs = (CharSequence) f;
         } catch (NoSuchFieldError ignored) {}
-        if (cs == null || cs.length() == 0) {
+
+        // Fall back to title
+        if (cs == null) {
             try {
                 Object f = XposedHelpers.getObjectField(item, "title");
-                if (f instanceof CharSequence) cs = (CharSequence) f;
+                if (f instanceof CharSequence && ((CharSequence) f).length() > 0)
+                    cs = (CharSequence) f;
             } catch (NoSuchFieldError ignored) {}
         }
+
+        // Last resort: componentName package label
+        if (cs == null) {
+            try {
+                Object cn = XposedHelpers.getObjectField(item, "componentName");
+                if (cn != null) {
+                    // cn is android.content.ComponentName
+                    String pkg = (String) cn.getClass()
+                            .getMethod("getPackageName").invoke(cn);
+                    if (pkg != null) return pkg;
+                }
+            } catch (Throwable ignored) {}
+        }
+
         return cs != null ? cs.toString() : "";
     }
 
