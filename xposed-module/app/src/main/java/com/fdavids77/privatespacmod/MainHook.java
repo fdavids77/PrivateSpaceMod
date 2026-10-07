@@ -18,27 +18,24 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v2.2 — Unified LSPosed module
+ * PrivateSpaceMod v2.3 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
- *                 WA clone users 11-15 are also stopped immediately.
- *                 No notifications from any clone while locked. ✓
- *   Launch PS   → Manually tap Private Space → user 10 unlocks (OS default).
- *                 WA clone users 11-15 are restarted automatically. ✓
+ *                 WA clone users 11-15 are also stopped. No notifications. ✓
+ *   Launch PS   → Tap Private Space → user 10 unlocks (OS default).
+ *                 WA clone users 11-15 restart automatically. ✓
  *   While open  → WA clones receive notifications normally. ✓
- *   Icon order  → Preserved on every PS unlock — sort suppressor prevents
- *                 AlphabeticalAppsList from reshuffling after user 10 restarts. ✓
+ *   Icon order  → Preserved on every PS unlock — onAppsUpdated suppressed
+ *                 in ActivityAllAppsContainerView during the unlock window. ✓
  *
  * Parts:
- *   1. Hide "Private" label + lock icon (PSLabelHider logic)
+ *   1. Hide "Private" label + lock icon
  *   2. Double-tap home screen → unlock Private Space
  *   3. system_server: stop clone users 11-15 when PS (user 10) locks
  *   4. system_server: restart clone users 11-15 when PS (user 10) unlocks
- *   5. Launcher: suppress icon re-sort after PS unlocks (AlphabeticalAppsList)
- *
- * NOTE: The requestQuietModeEnabled block for users 11-15 has been REMOVED.
- *       The OS can now pause/stop them freely — they follow Private Space.
+ *   5. Launcher: suppress onAppsUpdated in ActivityAllAppsContainerView
+ *      for 10 s after PS unlock so icons keep their positions
  *
  * Target: Pixel 9, Android 15/16/17, Magisk + LSPosed (JingMatrix/Vector)
  * Author: fdavids77
@@ -55,8 +52,16 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static boolean isUnlocking = false;
 
-    // Suppresses AlphabeticalAppsList re-sort for 3 s after PS unlocks
+    // Suppresses onAppsUpdated for SUPPRESS_MS after PS unlocks.
+    // Re-armed on each incoming onAppsUpdated call so the window slides
+    // forward with each user-start event rather than expiring too early.
     private static volatile boolean sSuppressNextSort = false;
+    private static final long SUPPRESS_MS = 10_000; // 10 s covers 5 users starting
+    private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
+    private static final Runnable sDisarmRunnable = () -> {
+        sSuppressNextSort = false;
+        XposedBridge.log(TAG + ": Sort suppressor disarmed");
+    };
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -78,68 +83,58 @@ public class MainHook implements IXposedHookLoadPackage {
     // PART 3 + 4: system_server — cascade stop/start of clone users with PS
     // =========================================================================
 
-    /**
-     * Hook UserController.stopSingleUserLU(userId, …) — fires when the OS
-     * stops a user.  When userId == 10 (Private Space locking), we immediately
-     * also stop users 11-15 so WA clones go dark.
-     *
-     * Hook UserController.startUserLU / onUserUnlocked — fires when user 10
-     * finishes unlocking.  We restart users 11-15 so WA clones come back.
-     */
     private void hookPrivateSpaceLockUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             Class<?> ucClass = XposedHelpers.findClass(
                     "com.android.server.am.UserController", lpparam.classLoader);
 
             // ── LOCK: stop clone users when PS stops ──────────────────────
+            boolean lockedHooked = false;
+            // Try 3-arg form first (Android 14+)
             try {
                 XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
-                        int.class,          // userId
-                        boolean.class,      // allowDelayedLocking
-                        boolean.class,      // stopProfileRegardlessOfParent
+                        int.class, boolean.class, boolean.class,
                         new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
-                                int userId = (int) param.args[0];
-                                if (userId == PRIVATE_SPACE_USER_ID) {
-                                    XposedBridge.log(TAG + ": PS user 10 stopped — cascading stop to users 11-15");
+                                if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
+                                    XposedBridge.log(TAG + ": PS user 10 stopped — cascading stop to 11-15");
                                     stopCloneUsers();
                                 }
                             }
                         });
-                XposedBridge.log(TAG + ": Hooked UserController.stopSingleUserLU");
-            } catch (NoSuchMethodError e) {
-                // Try 2-arg variant (older builds)
+                XposedBridge.log(TAG + ": Hooked stopSingleUserLU (3-arg)");
+                lockedHooked = true;
+            } catch (NoSuchMethodError ignored) {}
+
+            if (!lockedHooked) {
                 try {
                     XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
                             int.class, boolean.class,
                             new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) {
-                                    int userId = (int) param.args[0];
-                                    if (userId == PRIVATE_SPACE_USER_ID) {
-                                        XposedBridge.log(TAG + ": PS user 10 stopped (2-arg) — cascading stop to 11-15");
+                                    if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
+                                        XposedBridge.log(TAG + ": PS user 10 stopped (2-arg) — cascading stop");
                                         stopCloneUsers();
                                     }
                                 }
                             });
-                    XposedBridge.log(TAG + ": Hooked UserController.stopSingleUserLU (2-arg)");
-                } catch (NoSuchMethodError e2) {
-                    XposedBridge.log(TAG + ": stopSingleUserLU not found: " + e2.getMessage());
+                    XposedBridge.log(TAG + ": Hooked stopSingleUserLU (2-arg)");
+                } catch (NoSuchMethodError e) {
+                    XposedBridge.log(TAG + ": stopSingleUserLU not found: " + e.getMessage());
                 }
             }
 
             // ── UNLOCK: restart clone users when PS unlocks ───────────────
-            // onUserUnlocked fires after biometric confirm + user 10 is running
             try {
                 XposedHelpers.findAndHookMethod(ucClass, "onUserUnlocked",
-                        int.class,   // userId
+                        int.class,
                         new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
-                                int userId = (int) param.args[0];
-                                if (userId == PRIVATE_SPACE_USER_ID) {
-                                    XposedBridge.log(TAG + ": PS user 10 unlocked — restarting clone users 11-15");
+                                if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
+                                    XposedBridge.log(TAG + ": PS user 10 unlocked — restarting clones 11-15");
                                     startCloneUsers();
                                 }
                             }
@@ -154,15 +149,10 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Stop WA clone users 11-15 via `am stop-user -f <userId>`.
-     * Runs in a background thread to avoid blocking system_server main thread.
-     */
     private void stopCloneUsers() {
         new Thread(() -> {
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
-                    // `am stop-user -f` force-stops even if user has foreground activity
                     Process p = Runtime.getRuntime().exec(
                             new String[]{"sh", "-c", "am stop-user -f " + uid});
                     p.waitFor();
@@ -174,19 +164,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }, "PSMod-StopClones").start();
     }
 
-    /**
-     * Restart WA clone users 11-15 via `am start-user <userId>`.
-     * Also arms the icon-sort suppressor so the launcher doesn't reorder icons.
-     */
     private void startCloneUsers() {
-        // Arm the suppressor BEFORE users start — the sort fires during launcher
-        // workspace reload which happens concurrently with user start
+        // Arm suppressor BEFORE users start — drawer rebuilds fire concurrently
         armSuppressor();
 
         new Thread(() -> {
-            // Small delay to let user 10 fully settle before starting clones
             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
                     Process p = Runtime.getRuntime().exec(
@@ -201,25 +184,68 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // PART 5: Icon reorder fix — suppress AlphabeticalAppsList sort after unlock
+    // PART 5: Icon reorder fix
     // =========================================================================
 
+    /**
+     * The log shows the actual call chain:
+     *
+     *   ActivityAllAppsContainerView.onAppsUpdated()   ← this is what fires
+     *     → AlphabeticalAppsList.onAppsUpdated()
+     *       → addAppsWithSections()                    ← this sorts icons
+     *
+     * We hook ActivityAllAppsContainerView.onAppsUpdated() directly —
+     * blocking it prevents the entire sort chain.  Also hook the
+     * AllAppsContainerView superclass as a fallback.
+     *
+     * The suppressor is armed for SUPPRESS_MS.  Every incoming call that
+     * is suppressed re-arms the timer (sliding window), so 5 clone users
+     * starting sequentially don't expire the window mid-sequence.
+     */
     private void hookIconReorderFix(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookAlphabeticalAppsList(lpparam);
-        hookLauncherModelUserUnlock(lpparam);
-    }
+        // Primary: exact class from the log
+        String[] containerClasses = {
+                "com.android.launcher3.allapps.ActivityAllAppsContainerView",
+                "com.google.android.apps.nexuslauncher.allapps.ActivityAllAppsContainerView",
+                "com.android.launcher3.allapps.AllAppsContainerView",
+                "com.google.android.apps.nexuslauncher.allapps.AllAppsContainerView",
+        };
 
-    private void hookAlphabeticalAppsList(XC_LoadPackage.LoadPackageParam lpparam) {
-        String[] classNames = {
+        boolean hookedContainer = false;
+        for (String className : containerClasses) {
+            try {
+                Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
+                try {
+                    XposedHelpers.findAndHookMethod(clazz, "onAppsUpdated",
+                            new XC_MethodHook() {
+                                @Override
+                                protected void beforeHookedMethod(MethodHookParam param) {
+                                    if (sSuppressNextSort) {
+                                        // Re-arm: slide the window forward
+                                        armSuppressor();
+                                        XposedBridge.log(TAG + ": Suppressed "
+                                                + param.thisObject.getClass().getSimpleName()
+                                                + ".onAppsUpdated (PS unlock window)");
+                                        param.setResult(null);
+                                    }
+                                }
+                            });
+                    XposedBridge.log(TAG + ": Hooked " + className + ".onAppsUpdated");
+                    hookedContainer = true;
+                } catch (NoSuchMethodError e) {
+                    XposedBridge.log(TAG + ": onAppsUpdated not found on " + className);
+                }
+            } catch (XposedHelpers.ClassNotFoundError ignored) {}
+        }
+
+        // Secondary: AlphabeticalAppsList — belt-and-suspenders
+        String[] listClasses = {
                 "com.android.launcher3.allapps.AlphabeticalAppsList",
                 "com.google.android.apps.nexuslauncher.allapps.AlphabeticalAppsList"
         };
-
-        for (String className : classNames) {
+        for (String className : listClasses) {
             try {
                 Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
-                boolean hooked = false;
-
                 for (String method : new String[]{"onAppsUpdated", "updateItemFilter", "sortAndFilter"}) {
                     try {
                         XposedHelpers.findAndHookMethod(clazz, method,
@@ -227,72 +253,34 @@ public class MainHook implements IXposedHookLoadPackage {
                                     @Override
                                     protected void beforeHookedMethod(MethodHookParam param) {
                                         if (sSuppressNextSort) {
-                                            XposedBridge.log(TAG + ": Suppressed " + param.method.getName() + " (PS unlock sort)");
+                                            armSuppressor();
+                                            XposedBridge.log(TAG + ": Suppressed AlphabeticalAppsList."
+                                                    + param.method.getName());
                                             param.setResult(null);
                                         }
                                     }
                                 });
-                        hooked = true;
                     } catch (NoSuchMethodError ignored) {}
                 }
-
-                if (hooked) {
-                    XposedBridge.log(TAG + ": Icon-sort suppressor installed on " + className);
-                    break;
-                }
+                XposedBridge.log(TAG + ": Hooked AlphabeticalAppsList on " + className);
+                break;
             } catch (XposedHelpers.ClassNotFoundError ignored) {}
+        }
+
+        if (!hookedContainer) {
+            XposedBridge.log(TAG + ": WARNING — no ActivityAllAppsContainerView found; icon sort may still fire");
         }
     }
 
     /**
-     * Hook LauncherModel to detect user 10 unlock from the launcher side —
-     * arms the suppressor so the sort is skipped on the NEXT workspace reload.
+     * Arms the suppressor for SUPPRESS_MS.
+     * Cancels any pending disarm and resets the countdown — safe to call
+     * from any thread because Handler.post is thread-safe.
      */
-    private void hookLauncherModelUserUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
-        String[] modelClasses = {
-                "com.android.launcher3.LauncherModel",
-                "com.google.android.apps.nexuslauncher.LauncherModel"
-        };
-
-        for (String className : modelClasses) {
-            try {
-                Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
-
-                for (String method : new String[]{"onUserUnlocked", "onProfileAvailabilityChanged"}) {
-                    try {
-                        XposedHelpers.findAndHookMethod(clazz, method,
-                                UserHandle.class,
-                                new XC_MethodHook() {
-                                    @Override
-                                    protected void beforeHookedMethod(MethodHookParam param) {
-                                        try {
-                                            UserHandle uh = (UserHandle) param.args[0];
-                                            int uid = (int) XposedHelpers.callMethod(uh, "getIdentifier");
-                                            if (uid == PRIVATE_SPACE_USER_ID) {
-                                                XposedBridge.log(TAG + ": LauncherModel " + param.method.getName()
-                                                        + " for user 10 — arming suppressor");
-                                                armSuppressor();
-                                            }
-                                        } catch (Exception e) {
-                                            XposedBridge.log(TAG + ": Suppressor arm error: " + e.getMessage());
-                                        }
-                                    }
-                                });
-                        XposedBridge.log(TAG + ": Hooked " + className + "." + method);
-                        return;
-                    } catch (NoSuchMethodError ignored) {}
-                }
-            } catch (XposedHelpers.ClassNotFoundError ignored) {}
-        }
-    }
-
-    /** Arms the sort suppressor for 3 seconds. */
-    private void armSuppressor() {
+    private static void armSuppressor() {
         sSuppressNextSort = true;
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            sSuppressNextSort = false;
-            XposedBridge.log(TAG + ": Sort suppressor disarmed");
-        }, 3000);
+        sMainHandler.removeCallbacks(sDisarmRunnable);
+        sMainHandler.postDelayed(sDisarmRunnable, SUPPRESS_MS);
     }
 
     // =========================================================================
