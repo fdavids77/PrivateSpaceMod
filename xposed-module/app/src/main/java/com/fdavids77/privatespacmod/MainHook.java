@@ -81,10 +81,37 @@ public class MainHook implements IXposedHookLoadPackage {
     // PART 3 + 4: system_server — cascade stop/start of clone users with PS
     // =========================================================================
 
+    /**
+     * Dumps all UserController methods whose names contain "stop", "user", "lock", or "unlock"
+     * to the LSPosed modules log. Run once to discover Android 17 method signatures.
+     */
+    private void dumpUserControllerMethods(Class<?> ucClass) {
+        XposedBridge.log(TAG + ": === UserController method dump ===");
+        for (java.lang.reflect.Method m : ucClass.getDeclaredMethods()) {
+            String name = m.getName().toLowerCase();
+            if (name.contains("stop") || name.contains("user") ||
+                    name.contains("lock") || name.contains("unlock")) {
+                StringBuilder sb = new StringBuilder();
+                sb.append(TAG).append(": UC> ").append(m.getName()).append("(");
+                Class<?>[] params = m.getParameterTypes();
+                for (int i = 0; i < params.length; i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(params[i].getSimpleName());
+                }
+                sb.append(") -> ").append(m.getReturnType().getSimpleName());
+                XposedBridge.log(sb.toString());
+            }
+        }
+        XposedBridge.log(TAG + ": === UserController dump end ===");
+    }
+
     private void hookPrivateSpaceLockUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             Class<?> ucClass = XposedHelpers.findClass(
                     "com.android.server.am.UserController", lpparam.classLoader);
+
+            // Dump all relevant methods to identify correct Android 17 signatures
+            dumpUserControllerMethods(ucClass);
 
             // ── LOCK: stop clone users when PS stops ──────────────────────
             boolean lockHooked = false;
