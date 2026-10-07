@@ -105,28 +105,21 @@ public class MainHook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + ": === UserController dump end ===");
     }
 
+    // Held after first hook fires so stopCloneUsers/startCloneUsers can call back into it
+    private static Object sUserControllerInstance = null;
+
     private void hookPrivateSpaceLockUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             Class<?> ucClass = XposedHelpers.findClass(
                     "com.android.server.am.UserController", lpparam.classLoader);
 
             // ── LOCK: stop clone users when PS (user 10) stops ───────────
-            // Android 17 signature: stopSingleUserLU(int, boolean, IStopUserCallback, UserState$KeyEvictedCallback)
-            // Pass null for both callbacks — we only care about the userId arg.
+            // Android 17: stopSingleUserLU(int, boolean, IStopUserCallback, UserState$KeyEvictedCallback)
             try {
                 Class<?> iStopUserCallback = XposedHelpers.findClassIfExists(
                         "android.app.IStopUserCallback", lpparam.classLoader);
                 Class<?> keyEvictedCallback = XposedHelpers.findClassIfExists(
                         "com.android.server.am.UserState$KeyEvictedCallback", lpparam.classLoader);
-                if (iStopUserCallback == null) {
-                    iStopUserCallback = XposedHelpers.findClassIfExists(
-                            "android.app.IStopUserCallback", ClassLoader.getSystemClassLoader());
-                }
-                if (keyEvictedCallback == null) {
-                    keyEvictedCallback = XposedHelpers.findClassIfExists(
-                            "com.android.server.am.UserState$KeyEvictedCallback",
-                            ClassLoader.getSystemClassLoader());
-                }
 
                 if (iStopUserCallback != null && keyEvictedCallback != null) {
                     XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
@@ -135,23 +128,22 @@ public class MainHook implements IXposedHookLoadPackage {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) {
                                     if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
+                                        sUserControllerInstance = param.thisObject;
                                         XposedBridge.log(TAG + ": PS user 10 stopping — cascading stop to 11-15");
-                                        stopCloneUsers();
+                                        stopCloneUsers(param.thisObject, lpparam.classLoader);
                                     }
                                 }
                             });
                     XposedBridge.log(TAG + ": Hooked stopSingleUserLU(int,bool,IStopUserCallback,KeyEvictedCallback)");
                 } else {
-                    XposedBridge.log(TAG + ": stopSingleUserLU — callback classes not found, skipping lock hook");
+                    XposedBridge.log(TAG + ": stopSingleUserLU — callback classes not found");
                 }
             } catch (NoSuchMethodError e) {
                 XposedBridge.log(TAG + ": stopSingleUserLU hook failed: " + e.getMessage());
             }
 
             // ── UNLOCK: restart clone users when PS (user 10) unlocks ─────
-            // Android 17: onUserUnlocked(int) is gone; maybeUnlockUser(int) fires on unlock.
-            // finishUserUnlocked(UserState) is the definitive point but needs UserState.
-            // We hook both: maybeUnlockUser as the trigger, finishUserUnlocked as confirmation.
+            // Android 17: maybeUnlockUser(int) replaces onUserUnlocked(int)
             try {
                 XposedHelpers.findAndHookMethod(ucClass, "maybeUnlockUser",
                         int.class,
@@ -159,8 +151,9 @@ public class MainHook implements IXposedHookLoadPackage {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
                                 if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
+                                    sUserControllerInstance = param.thisObject;
                                     XposedBridge.log(TAG + ": PS user 10 maybeUnlockUser — restarting clones 11-15");
-                                    startCloneUsers();
+                                    startCloneUsers(param.thisObject, lpparam.classLoader);
                                 }
                             }
                         });
@@ -174,34 +167,45 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private void stopCloneUsers() {
+    /**
+     * Stop clone users 11-15 by calling UserController.stopUser() directly —
+     * no shell exec, so no EACCES. We're already uid 1000 inside system_server.
+     * stopUser(int userId, boolean force, IStopUserCallback cb, KeyEvictedCallback kec)
+     */
+    private void stopCloneUsers(Object ucInstance, ClassLoader cl) {
         new Thread(() -> {
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
-                    Process p = Runtime.getRuntime().exec(
-                            new String[]{"sh", "-c", "am stop-user -f " + uid});
-                    p.waitFor();
-                    XposedBridge.log(TAG + ": Stopped clone user " + uid);
+                    // stopUser(int, boolean, IStopUserCallback, UserState$KeyEvictedCallback)
+                    // Pass true for force, null for both callbacks
+                    XposedHelpers.callMethod(ucInstance, "stopUser",
+                            uid, true, null, null);
+                    XposedBridge.log(TAG + ": stopUser(" + uid + ") called");
                 } catch (Exception e) {
-                    XposedBridge.log(TAG + ": Failed to stop user " + uid + ": " + e.getMessage());
+                    XposedBridge.log(TAG + ": stopUser(" + uid + ") failed: " + e.getMessage());
                 }
             }
         }, "PSMod-StopClones").start();
     }
 
-    private void startCloneUsers() {
+    /**
+     * Start clone users 11-15 by calling UserController.startUser() directly.
+     * startUser(int userId, int startMode) — startMode 0 = START_MODE_BACKGROUND
+     */
+    private void startCloneUsers(Object ucInstance, ClassLoader cl) {
         new Thread(() -> {
-            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
                 try {
-                    Process p = Runtime.getRuntime().exec(
-                            new String[]{"sh", "-c", "am start-user " + uid});
-                    p.waitFor();
-                    XposedBridge.log(TAG + ": Started clone user " + uid);
+                    // startUser(int, int) — second arg is startMode; 0 = background
+                    XposedHelpers.callMethod(ucInstance, "startUser", uid, 0);
+                    XposedBridge.log(TAG + ": startUser(" + uid + ") called");
                 } catch (Exception e) {
-                    XposedBridge.log(TAG + ": Failed to start user " + uid + ": " + e.getMessage());
+                    XposedBridge.log(TAG + ": startUser(" + uid + ") failed: " + e.getMessage());
                 }
             }
+            // Arm the icon suppressor now that users are restarting
+            armSuppressor();
         }, "PSMod-StartClones").start();
     }
 
