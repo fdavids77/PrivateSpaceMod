@@ -18,7 +18,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v2.3 — Unified LSPosed module
+ * PrivateSpaceMod v2.4 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
@@ -26,8 +26,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   Launch PS   → Tap Private Space → user 10 unlocks (OS default).
  *                 WA clone users 11-15 restart automatically. ✓
  *   While open  → WA clones receive notifications normally. ✓
- *   Icon order  → Preserved on every PS unlock — onAppsUpdated suppressed
- *                 in ActivityAllAppsContainerView during the unlock window. ✓
+ *   Icon order  → Preserved on every PS unlock. ✓
  *
  * Parts:
  *   1. Hide "Private" label + lock icon
@@ -35,7 +34,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   3. system_server: stop clone users 11-15 when PS (user 10) locks
  *   4. system_server: restart clone users 11-15 when PS (user 10) unlocks
  *   5. Launcher: suppress onAppsUpdated in ActivityAllAppsContainerView
- *      for 10 s after PS unlock so icons keep their positions
+ *
+ * v2.4 fix: removed static Handler/Runnable field initializers — those ran
+ * at class-load time before the main Looper existed, silently crashing the
+ * whole module. Now initialized lazily inside armSuppressor().
  *
  * Target: Pixel 9, Android 15/16/17, Magisk + LSPosed (JingMatrix/Vector)
  * Author: fdavids77
@@ -49,19 +51,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int PRIVATE_SPACE_USER_ID = 10;
     private static final int WA_USER_MIN = 11;
     private static final int WA_USER_MAX = 15;
+    private static final long SUPPRESS_MS = 10_000;
 
     private static boolean isUnlocking = false;
-
-    // Suppresses onAppsUpdated for SUPPRESS_MS after PS unlocks.
-    // Re-armed on each incoming onAppsUpdated call so the window slides
-    // forward with each user-start event rather than expiring too early.
     private static volatile boolean sSuppressNextSort = false;
-    private static final long SUPPRESS_MS = 10_000; // 10 s covers 5 users starting
-    private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
-    private static final Runnable sDisarmRunnable = () -> {
-        sSuppressNextSort = false;
-        XposedBridge.log(TAG + ": Sort suppressor disarmed");
-    };
+
+    // Initialized lazily in armSuppressor() — NOT as static field initializers,
+    // because Looper.getMainLooper() may be null at class-load time under LSPosed.
+    private static Handler sMainHandler = null;
+    private static Runnable sDisarmRunnable = null;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -89,8 +87,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     "com.android.server.am.UserController", lpparam.classLoader);
 
             // ── LOCK: stop clone users when PS stops ──────────────────────
-            boolean lockedHooked = false;
-            // Try 3-arg form first (Android 14+)
+            boolean lockHooked = false;
             try {
                 XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
                         int.class, boolean.class, boolean.class,
@@ -104,10 +101,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         });
                 XposedBridge.log(TAG + ": Hooked stopSingleUserLU (3-arg)");
-                lockedHooked = true;
+                lockHooked = true;
             } catch (NoSuchMethodError ignored) {}
 
-            if (!lockedHooked) {
+            if (!lockHooked) {
                 try {
                     XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
                             int.class, boolean.class,
@@ -165,9 +162,6 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void startCloneUsers() {
-        // Arm suppressor BEFORE users start — drawer rebuilds fire concurrently
-        armSuppressor();
-
         new Thread(() -> {
             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
@@ -187,23 +181,8 @@ public class MainHook implements IXposedHookLoadPackage {
     // PART 5: Icon reorder fix
     // =========================================================================
 
-    /**
-     * The log shows the actual call chain:
-     *
-     *   ActivityAllAppsContainerView.onAppsUpdated()   ← this is what fires
-     *     → AlphabeticalAppsList.onAppsUpdated()
-     *       → addAppsWithSections()                    ← this sorts icons
-     *
-     * We hook ActivityAllAppsContainerView.onAppsUpdated() directly —
-     * blocking it prevents the entire sort chain.  Also hook the
-     * AllAppsContainerView superclass as a fallback.
-     *
-     * The suppressor is armed for SUPPRESS_MS.  Every incoming call that
-     * is suppressed re-arms the timer (sliding window), so 5 clone users
-     * starting sequentially don't expire the window mid-sequence.
-     */
     private void hookIconReorderFix(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Primary: exact class from the log
+        // Primary targets from logcat: ActivityAllAppsContainerView.onAppsUpdated
         String[] containerClasses = {
                 "com.android.launcher3.allapps.ActivityAllAppsContainerView",
                 "com.google.android.apps.nexuslauncher.allapps.ActivityAllAppsContainerView",
@@ -211,7 +190,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 "com.google.android.apps.nexuslauncher.allapps.AllAppsContainerView",
         };
 
-        boolean hookedContainer = false;
         for (String className : containerClasses) {
             try {
                 Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
@@ -221,24 +199,22 @@ public class MainHook implements IXposedHookLoadPackage {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) {
                                     if (sSuppressNextSort) {
-                                        // Re-arm: slide the window forward
-                                        armSuppressor();
+                                        armSuppressor(); // slide the window
                                         XposedBridge.log(TAG + ": Suppressed "
                                                 + param.thisObject.getClass().getSimpleName()
-                                                + ".onAppsUpdated (PS unlock window)");
+                                                + ".onAppsUpdated");
                                         param.setResult(null);
                                     }
                                 }
                             });
                     XposedBridge.log(TAG + ": Hooked " + className + ".onAppsUpdated");
-                    hookedContainer = true;
                 } catch (NoSuchMethodError e) {
                     XposedBridge.log(TAG + ": onAppsUpdated not found on " + className);
                 }
             } catch (XposedHelpers.ClassNotFoundError ignored) {}
         }
 
-        // Secondary: AlphabeticalAppsList — belt-and-suspenders
+        // Belt-and-suspenders: AlphabeticalAppsList
         String[] listClasses = {
                 "com.android.launcher3.allapps.AlphabeticalAppsList",
                 "com.google.android.apps.nexuslauncher.allapps.AlphabeticalAppsList"
@@ -267,17 +243,56 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (XposedHelpers.ClassNotFoundError ignored) {}
         }
 
-        if (!hookedContainer) {
-            XposedBridge.log(TAG + ": WARNING — no ActivityAllAppsContainerView found; icon sort may still fire");
+        // Arm suppressor when LauncherModel sees user 10 profile change
+        String[] modelClasses = {
+                "com.android.launcher3.LauncherModel",
+                "com.google.android.apps.nexuslauncher.LauncherModel"
+        };
+        for (String className : modelClasses) {
+            try {
+                Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
+                for (String method : new String[]{"onUserUnlocked", "onProfileAvailabilityChanged"}) {
+                    try {
+                        XposedHelpers.findAndHookMethod(clazz, method,
+                                UserHandle.class,
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void beforeHookedMethod(MethodHookParam param) {
+                                        try {
+                                            UserHandle uh = (UserHandle) param.args[0];
+                                            int uid = (int) XposedHelpers.callMethod(uh, "getIdentifier");
+                                            if (uid == PRIVATE_SPACE_USER_ID) {
+                                                XposedBridge.log(TAG + ": LauncherModel."
+                                                        + param.method.getName()
+                                                        + " for user 10 — arming suppressor");
+                                                armSuppressor();
+                                            }
+                                        } catch (Exception e) {
+                                            XposedBridge.log(TAG + ": arm error: " + e.getMessage());
+                                        }
+                                    }
+                                });
+                        XposedBridge.log(TAG + ": Hooked " + className + "." + method);
+                        return;
+                    } catch (NoSuchMethodError ignored) {}
+                }
+            } catch (XposedHelpers.ClassNotFoundError ignored) {}
         }
     }
 
     /**
-     * Arms the suppressor for SUPPRESS_MS.
-     * Cancels any pending disarm and resets the countdown — safe to call
-     * from any thread because Handler.post is thread-safe.
+     * Arms the sort suppressor for SUPPRESS_MS.
+     * Lazy-initializes Handler/Runnable on first call (after Looper is ready).
+     * Cancels any pending disarm and resets the countdown.
      */
-    private static void armSuppressor() {
+    private static synchronized void armSuppressor() {
+        if (sMainHandler == null) {
+            sMainHandler = new Handler(Looper.getMainLooper());
+            sDisarmRunnable = () -> {
+                sSuppressNextSort = false;
+                XposedBridge.log(TAG + ": Sort suppressor disarmed");
+            };
+        }
         sSuppressNextSort = true;
         sMainHandler.removeCallbacks(sDisarmRunnable);
         sMainHandler.postDelayed(sDisarmRunnable, SUPPRESS_MS);
@@ -378,10 +393,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // =========================================================================
 
     private void hookDoubleTapGesture(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookWorkspaceTouchListenerDoubleTap(lpparam);
-    }
-
-    private void hookWorkspaceTouchListenerDoubleTap(XC_LoadPackage.LoadPackageParam lpparam) {
         String[] touchListenerClasses = {
                 "com.android.launcher3.touch.WorkspaceTouchListener",
                 "com.google.android.apps.nexuslauncher.touch.WorkspaceTouchListener"
@@ -401,7 +412,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                             param.thisObject, "mLauncher");
                                     unlockPrivateSpace((Context) launcher);
                                 } catch (Exception e) {
-                                    XposedBridge.log(TAG + ": Double-tap hook error: " + e.getMessage());
+                                    XposedBridge.log(TAG + ": Double-tap error: " + e.getMessage());
                                 }
                                 param.setResult(true);
                             }
@@ -411,16 +422,11 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (XposedHelpers.ClassNotFoundError | NoSuchMethodError ignored) {}
         }
 
-        XposedBridge.log(TAG + ": WorkspaceTouchListener not found, trying fallback");
-        hookGestureDetectorFallback(lpparam);
-    }
-
-    private void hookGestureDetectorFallback(XC_LoadPackage.LoadPackageParam lpparam) {
+        // Fallback
         try {
             XposedHelpers.findAndHookMethod(
                     "android.view.GestureDetector$SimpleOnGestureListener",
-                    lpparam.classLoader,
-                    "onDoubleTap",
+                    lpparam.classLoader, "onDoubleTap",
                     android.view.MotionEvent.class,
                     new XC_MethodHook() {
                         @Override
@@ -429,15 +435,12 @@ public class MainHook implements IXposedHookLoadPackage {
                             if (cls.contains("Workspace") || cls.contains("DragLayer")) {
                                 try {
                                     Context ctx = null;
-                                    try {
-                                        ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mLauncher");
-                                    } catch (NoSuchFieldError e1) {
-                                        try {
-                                            ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mActivity");
-                                        } catch (NoSuchFieldError e2) {
-                                            if (param.thisObject instanceof View) {
+                                    try { ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mLauncher"); }
+                                    catch (NoSuchFieldError e1) {
+                                        try { ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mActivity"); }
+                                        catch (NoSuchFieldError e2) {
+                                            if (param.thisObject instanceof View)
                                                 ctx = ((View) param.thisObject).getContext();
-                                            }
                                         }
                                     }
                                     if (ctx != null) unlockPrivateSpace(ctx);
@@ -447,8 +450,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 param.setResult(true);
                             }
                         }
-                    }
-            );
+                    });
         } catch (Exception e) {
             XposedBridge.log(TAG + ": GestureDetector fallback failed: " + e.getMessage());
         }
@@ -468,12 +470,10 @@ public class MainHook implements IXposedHookLoadPackage {
                     try {
                         UserManager um = (UserManager) context.getSystemService(Context.USER_SERVICE);
                         if (um == null) { isUnlocking = false; return; }
-
                         Method ofMethod = UserHandle.class.getDeclaredMethod("of", int.class);
                         UserHandle psUser = (UserHandle) ofMethod.invoke(null, PRIVATE_SPACE_USER_ID);
                         boolean result = um.requestQuietModeEnabled(false, psUser);
                         XposedBridge.log(TAG + ": requestQuietModeEnabled(false) = " + result);
-
                     } catch (SecurityException se) {
                         unlockViaActivity(context);
                     } catch (Exception e) {
