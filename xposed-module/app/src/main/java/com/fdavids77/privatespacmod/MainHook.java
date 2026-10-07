@@ -19,7 +19,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v3.6 — Unified LSPosed module
+ * PrivateSpaceMod v3.7 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
@@ -28,6 +28,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *                 WA clone users 11-15 restart automatically. ✓
  *   While open  → WA clones receive notifications normally. ✓
  *   Icon order  → Preserved on every PS unlock. ✓
+ *
+ * v3.7 changes vs v3.6:
+ *   - Fix alphabetical sort: appTitle/title are null at compare() time because
+ *     labels are populated lazily by the launcher. Add a PackageManager fallback
+ *     with a static HashMap<String,String> cache — PM is called at most once per
+ *     package per sort session. Apps now sort by their display name (A-Z) rather
+ *     than by package name.
  *
  * v3.5 changes vs v3.4:
  *   - Alphabetical sort: Hook AppInfoComparator.compare(AppInfo,AppInfo) in the
@@ -700,25 +707,33 @@ public class MainHook implements IXposedHookLoadPackage {
     /**
      * Extract a display label string from an AppInfo / ItemInfo object.
      *
-     * Field search order (confirmed from Pixel Launcher dexdump, Android 17):
-     *   1. appTitle  — CharSequence on ItemInfo, set from PackageManager label
-     *   2. title     — CharSequence on ItemInfo base class (same value, set earlier)
+     * Field search order:
+     *   1. appTitle  — CharSequence on ItemInfo (set from PackageManager label)
+     *   2. title     — CharSequence on ItemInfo base class
+     *   3. PackageManager.getApplicationLabel() — resolved via ActivityThread,
+     *      cached in sLabelCache so PM is called at most once per package per
+     *      launcher session (avoids calling PM 400+ times per sort).
+     *   4. Package name — last resort so the sort is still deterministic.
      *
-     * If both are null/empty we fall back to the package name from componentName
-     * so the sort is still deterministic rather than leaving everything as "".
+     * Root cause of v3.6 bug: appTitle and title are null when compare() is
+     * first called because labels are populated lazily. The PM fallback (step 3)
+     * is the real fix.
      */
+    private static final java.util.HashMap<String, String> sLabelCache =
+            new java.util.HashMap<>();
+
     private static String getLabelString(Object item) {
         if (item == null) return "";
         CharSequence cs = null;
 
-        // Try appTitle first
+        // 1. Try appTitle
         try {
             Object f = XposedHelpers.getObjectField(item, "appTitle");
             if (f instanceof CharSequence && ((CharSequence) f).length() > 0)
                 cs = (CharSequence) f;
         } catch (NoSuchFieldError ignored) {}
 
-        // Fall back to title
+        // 2. Fall back to title
         if (cs == null) {
             try {
                 Object f = XposedHelpers.getObjectField(item, "title");
@@ -727,20 +742,48 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (NoSuchFieldError ignored) {}
         }
 
-        // Last resort: componentName package label
-        if (cs == null) {
-            try {
-                Object cn = XposedHelpers.getObjectField(item, "componentName");
-                if (cn != null) {
-                    // cn is android.content.ComponentName
-                    String pkg = (String) cn.getClass()
-                            .getMethod("getPackageName").invoke(cn);
-                    if (pkg != null) return pkg;
-                }
-            } catch (Throwable ignored) {}
-        }
+        if (cs != null) return cs.toString();
 
-        return cs != null ? cs.toString() : "";
+        // 3. Resolve display label from PackageManager, cached per package
+        try {
+            Object cn = XposedHelpers.getObjectField(item, "componentName");
+            if (cn != null) {
+                String pkg = (String) cn.getClass()
+                        .getMethod("getPackageName").invoke(cn);
+                if (pkg != null) {
+                    // Return cached value if we've already resolved this package
+                    String cached = sLabelCache.get(pkg);
+                    if (cached != null) return cached;
+
+                    // Ask PackageManager for the display label
+                    try {
+                        android.app.ActivityThread at =
+                                android.app.ActivityThread.currentActivityThread();
+                        if (at != null) {
+                            android.content.pm.PackageManager pm =
+                                    at.getApplication().getPackageManager();
+                            android.content.pm.ApplicationInfo ai =
+                                    pm.getApplicationInfo(pkg, 0);
+                            String label = pm.getApplicationLabel(ai).toString();
+                            sLabelCache.put(pkg, label);
+                            return label;
+                        }
+                    } catch (android.content.pm.PackageManager.NameNotFoundException ignored) {
+                        // Package not found — cache the package name itself
+                        sLabelCache.put(pkg, pkg);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + ": getLabelString PM lookup failed for "
+                                + pkg + ": " + t);
+                        sLabelCache.put(pkg, pkg); // cache to avoid repeated failures
+                    }
+
+                    // 4. Last resort: package name (deterministic, not pretty)
+                    return pkg;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return "";
     }
 
     // =========================================================================
