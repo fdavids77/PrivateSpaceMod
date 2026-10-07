@@ -755,13 +755,21 @@ public class MainHook implements IXposedHookLoadPackage {
                     String cached = sLabelCache.get(pkg);
                     if (cached != null) return cached;
 
-                    // Ask PackageManager for the display label
+                    // Ask PackageManager for the display label.
+                    // ActivityThread is a hidden class — access via reflection so
+                    // the public SDK stub doesn't need to expose it.
                     try {
-                        android.app.ActivityThread at =
-                                android.app.ActivityThread.currentActivityThread();
+                        Class<?> atClass = Class.forName("android.app.ActivityThread");
+                        java.lang.reflect.Method current =
+                                atClass.getMethod("currentActivityThread");
+                        Object at = current.invoke(null);
                         if (at != null) {
+                            java.lang.reflect.Method getApp =
+                                    atClass.getMethod("getApplication");
+                            android.app.Application app =
+                                    (android.app.Application) getApp.invoke(at);
                             android.content.pm.PackageManager pm =
-                                    at.getApplication().getPackageManager();
+                                    app.getPackageManager();
                             android.content.pm.ApplicationInfo ai =
                                     pm.getApplicationInfo(pkg, 0);
                             String label = pm.getApplicationLabel(ai).toString();
