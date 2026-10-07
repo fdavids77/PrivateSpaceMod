@@ -18,14 +18,27 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v2.1 — Unified LSPosed module
+ * PrivateSpaceMod v2.2 — Unified LSPosed module
  *
- * Single module:
- *   1. Hide "Private" label + lock icon (PSLabelHider v1.15 logic)
- *   2. Double-tap home screen → unlock Private Space directly
- *   3. [NEW] Block UserManagerService.requestQuietModeEnabled() for WA clone
- *      profiles (userIds 11–15) so the OS can never auto-pause them.
- *      Runs in system_server (android process).
+ * Behaviour (Samsung Secure Folder model):
+ *   Screen off  → Private Space (user 10) auto-locks.
+ *                 WA clone users 11-15 are also stopped immediately.
+ *                 No notifications from any clone while locked. ✓
+ *   Launch PS   → Manually tap Private Space → user 10 unlocks (OS default).
+ *                 WA clone users 11-15 are restarted automatically. ✓
+ *   While open  → WA clones receive notifications normally. ✓
+ *   Icon order  → Preserved on every PS unlock — sort suppressor prevents
+ *                 AlphabeticalAppsList from reshuffling after user 10 restarts. ✓
+ *
+ * Parts:
+ *   1. Hide "Private" label + lock icon (PSLabelHider logic)
+ *   2. Double-tap home screen → unlock Private Space
+ *   3. system_server: stop clone users 11-15 when PS (user 10) locks
+ *   4. system_server: restart clone users 11-15 when PS (user 10) unlocks
+ *   5. Launcher: suppress icon re-sort after PS unlocks (AlphabeticalAppsList)
+ *
+ * NOTE: The requestQuietModeEnabled block for users 11-15 has been REMOVED.
+ *       The OS can now pause/stop them freely — they follow Private Space.
  *
  * Target: Pixel 9, Android 15/16/17, Magisk + LSPosed (JingMatrix/Vector)
  * Author: fdavids77
@@ -36,122 +49,250 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String LAUNCHER_PKG = "com.google.android.apps.nexuslauncher";
     private static final String SYSTEM_SERVER_PKG = "android";
 
-    // WA clone profile user IDs to protect from auto-pause
+    private static final int PRIVATE_SPACE_USER_ID = 10;
     private static final int WA_USER_MIN = 11;
     private static final int WA_USER_MAX = 15;
 
-    private static final int PRIVATE_SPACE_USER_ID = 10;
     private static boolean isUnlocking = false;
+
+    // Suppresses AlphabeticalAppsList re-sort for 3 s after PS unlocks
+    private static volatile boolean sSuppressNextSort = false;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
 
-        // ── system_server: block quiet-mode re-enablement for clone users ──
         if (lpparam.packageName.equals(SYSTEM_SERVER_PKG)) {
-            hookNoQuietMode(lpparam);
+            hookPrivateSpaceLockUnlock(lpparam);
             return;
         }
 
-        // ── Pixel Launcher: label hider + double-tap unlock ──
         if (lpparam.packageName.equals(LAUNCHER_PKG)) {
             XposedBridge.log(TAG + ": Hooking Pixel Launcher");
             hookLabelHider(lpparam);
             hookDoubleTapGesture(lpparam);
+            hookIconReorderFix(lpparam);
         }
     }
 
     // =========================================================================
-    // PART 3 (NEW): No-Quiet-Mode hook — system_server / UserManagerService
+    // PART 3 + 4: system_server — cascade stop/start of clone users with PS
     // =========================================================================
 
     /**
-     * Hook UserManagerService.requestQuietModeEnabled() running inside
-     * system_server.  If the OS tries to enable quiet mode (pause) on any of
-     * the WA clone profiles (users 11-15) we simply return false and skip the
-     * real method — the profiles stay running.
+     * Hook UserController.stopSingleUserLU(userId, …) — fires when the OS
+     * stops a user.  When userId == 10 (Private Space locking), we immediately
+     * also stop users 11-15 so WA clones go dark.
      *
-     * Method signature on Android 13-17:
-     *   boolean requestQuietModeEnabled(String callingPackage, boolean enableQuietMode,
-     *                                   int userId, IntentSender target, int flags)
+     * Hook UserController.startUserLU / onUserUnlocked — fires when user 10
+     * finishes unlocking.  We restart users 11-15 so WA clones come back.
      */
-    private void hookNoQuietMode(XC_LoadPackage.LoadPackageParam lpparam) {
+    private void hookPrivateSpaceLockUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
-            Class<?> ums = XposedHelpers.findClass(
-                    "com.android.server.pm.UserManagerService",
-                    lpparam.classLoader);
+            Class<?> ucClass = XposedHelpers.findClass(
+                    "com.android.server.am.UserController", lpparam.classLoader);
 
-            // Hook the 5-arg form (present on Android 13+)
-            XposedHelpers.findAndHookMethod(
-                    ums,
-                    "requestQuietModeEnabled",
-                    String.class,                        // callingPackage
-                    boolean.class,                       // enableQuietMode
-                    int.class,                           // userId
-                    android.content.IntentSender.class,  // target
-                    int.class,                           // flags
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            boolean enable = (boolean) param.args[1];
-                            int userId   = (int)    param.args[2];
-
-                            if (enable && userId >= WA_USER_MIN && userId <= WA_USER_MAX) {
-                                XposedBridge.log(TAG + ": BLOCKED requestQuietModeEnabled("
-                                        + "enable=true, userId=" + userId + ") from "
-                                        + param.args[0]);
-                                // Return false → caller sees "request denied"
-                                param.setResult(false);
+            // ── LOCK: stop clone users when PS stops ──────────────────────
+            try {
+                XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
+                        int.class,          // userId
+                        boolean.class,      // allowDelayedLocking
+                        boolean.class,      // stopProfileRegardlessOfParent
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                int userId = (int) param.args[0];
+                                if (userId == PRIVATE_SPACE_USER_ID) {
+                                    XposedBridge.log(TAG + ": PS user 10 stopped — cascading stop to users 11-15");
+                                    stopCloneUsers();
+                                }
                             }
-                        }
-                    }
-            );
-            XposedBridge.log(TAG + ": NoQuietMode hook installed for userIds "
-                    + WA_USER_MIN + "-" + WA_USER_MAX);
+                        });
+                XposedBridge.log(TAG + ": Hooked UserController.stopSingleUserLU");
+            } catch (NoSuchMethodError e) {
+                // Try 2-arg variant (older builds)
+                try {
+                    XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
+                            int.class, boolean.class,
+                            new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    int userId = (int) param.args[0];
+                                    if (userId == PRIVATE_SPACE_USER_ID) {
+                                        XposedBridge.log(TAG + ": PS user 10 stopped (2-arg) — cascading stop to 11-15");
+                                        stopCloneUsers();
+                                    }
+                                }
+                            });
+                    XposedBridge.log(TAG + ": Hooked UserController.stopSingleUserLU (2-arg)");
+                } catch (NoSuchMethodError e2) {
+                    XposedBridge.log(TAG + ": stopSingleUserLU not found: " + e2.getMessage());
+                }
+            }
+
+            // ── UNLOCK: restart clone users when PS unlocks ───────────────
+            // onUserUnlocked fires after biometric confirm + user 10 is running
+            try {
+                XposedHelpers.findAndHookMethod(ucClass, "onUserUnlocked",
+                        int.class,   // userId
+                        new XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                int userId = (int) param.args[0];
+                                if (userId == PRIVATE_SPACE_USER_ID) {
+                                    XposedBridge.log(TAG + ": PS user 10 unlocked — restarting clone users 11-15");
+                                    startCloneUsers();
+                                }
+                            }
+                        });
+                XposedBridge.log(TAG + ": Hooked UserController.onUserUnlocked");
+            } catch (NoSuchMethodError e) {
+                XposedBridge.log(TAG + ": onUserUnlocked not found: " + e.getMessage());
+            }
 
         } catch (XposedHelpers.ClassNotFoundError e) {
-            XposedBridge.log(TAG + ": UserManagerService class not found: " + e.getMessage());
-        } catch (NoSuchMethodError e) {
-            // Android version may have a different signature — try 4-arg form (Android 10-12)
-            tryHookNoQuietModeLegacy(lpparam);
+            XposedBridge.log(TAG + ": UserController not found: " + e.getMessage());
         }
     }
 
     /**
-     * Fallback: 4-arg form used on older Android versions (no IntentSender param).
-     *   boolean requestQuietModeEnabled(String callingPackage, boolean enableQuietMode,
-     *                                   int userId, int flags)
+     * Stop WA clone users 11-15 via `am stop-user -f <userId>`.
+     * Runs in a background thread to avoid blocking system_server main thread.
      */
-    private void tryHookNoQuietModeLegacy(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            Class<?> ums = XposedHelpers.findClass(
-                    "com.android.server.pm.UserManagerService",
-                    lpparam.classLoader);
+    private void stopCloneUsers() {
+        new Thread(() -> {
+            for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
+                try {
+                    // `am stop-user -f` force-stops even if user has foreground activity
+                    Process p = Runtime.getRuntime().exec(
+                            new String[]{"sh", "-c", "am stop-user -f " + uid});
+                    p.waitFor();
+                    XposedBridge.log(TAG + ": Stopped clone user " + uid);
+                } catch (Exception e) {
+                    XposedBridge.log(TAG + ": Failed to stop user " + uid + ": " + e.getMessage());
+                }
+            }
+        }, "PSMod-StopClones").start();
+    }
 
-            XposedHelpers.findAndHookMethod(
-                    ums,
-                    "requestQuietModeEnabled",
-                    String.class,
-                    boolean.class,
-                    int.class,
-                    int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            boolean enable = (boolean) param.args[1];
-                            int userId   = (int)    param.args[2];
+    /**
+     * Restart WA clone users 11-15 via `am start-user <userId>`.
+     * Also arms the icon-sort suppressor so the launcher doesn't reorder icons.
+     */
+    private void startCloneUsers() {
+        // Arm the suppressor BEFORE users start — the sort fires during launcher
+        // workspace reload which happens concurrently with user start
+        armSuppressor();
 
-                            if (enable && userId >= WA_USER_MIN && userId <= WA_USER_MAX) {
-                                XposedBridge.log(TAG + ": BLOCKED (legacy) requestQuietModeEnabled("
-                                        + "enable=true, userId=" + userId + ")");
-                                param.setResult(false);
-                            }
-                        }
-                    }
-            );
-            XposedBridge.log(TAG + ": NoQuietMode hook (legacy 4-arg) installed");
-        } catch (Exception e) {
-            XposedBridge.log(TAG + ": NoQuietMode legacy hook also failed: " + e.getMessage());
+        new Thread(() -> {
+            // Small delay to let user 10 fully settle before starting clones
+            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+
+            for (int uid = WA_USER_MIN; uid <= WA_USER_MAX; uid++) {
+                try {
+                    Process p = Runtime.getRuntime().exec(
+                            new String[]{"sh", "-c", "am start-user " + uid});
+                    p.waitFor();
+                    XposedBridge.log(TAG + ": Started clone user " + uid);
+                } catch (Exception e) {
+                    XposedBridge.log(TAG + ": Failed to start user " + uid + ": " + e.getMessage());
+                }
+            }
+        }, "PSMod-StartClones").start();
+    }
+
+    // =========================================================================
+    // PART 5: Icon reorder fix — suppress AlphabeticalAppsList sort after unlock
+    // =========================================================================
+
+    private void hookIconReorderFix(XC_LoadPackage.LoadPackageParam lpparam) {
+        hookAlphabeticalAppsList(lpparam);
+        hookLauncherModelUserUnlock(lpparam);
+    }
+
+    private void hookAlphabeticalAppsList(XC_LoadPackage.LoadPackageParam lpparam) {
+        String[] classNames = {
+                "com.android.launcher3.allapps.AlphabeticalAppsList",
+                "com.google.android.apps.nexuslauncher.allapps.AlphabeticalAppsList"
+        };
+
+        for (String className : classNames) {
+            try {
+                Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
+                boolean hooked = false;
+
+                for (String method : new String[]{"onAppsUpdated", "updateItemFilter", "sortAndFilter"}) {
+                    try {
+                        XposedHelpers.findAndHookMethod(clazz, method,
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void beforeHookedMethod(MethodHookParam param) {
+                                        if (sSuppressNextSort) {
+                                            XposedBridge.log(TAG + ": Suppressed " + param.method.getName() + " (PS unlock sort)");
+                                            param.setResult(null);
+                                        }
+                                    }
+                                });
+                        hooked = true;
+                    } catch (NoSuchMethodError ignored) {}
+                }
+
+                if (hooked) {
+                    XposedBridge.log(TAG + ": Icon-sort suppressor installed on " + className);
+                    break;
+                }
+            } catch (XposedHelpers.ClassNotFoundError ignored) {}
         }
+    }
+
+    /**
+     * Hook LauncherModel to detect user 10 unlock from the launcher side —
+     * arms the suppressor so the sort is skipped on the NEXT workspace reload.
+     */
+    private void hookLauncherModelUserUnlock(XC_LoadPackage.LoadPackageParam lpparam) {
+        String[] modelClasses = {
+                "com.android.launcher3.LauncherModel",
+                "com.google.android.apps.nexuslauncher.LauncherModel"
+        };
+
+        for (String className : modelClasses) {
+            try {
+                Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
+
+                for (String method : new String[]{"onUserUnlocked", "onProfileAvailabilityChanged"}) {
+                    try {
+                        XposedHelpers.findAndHookMethod(clazz, method,
+                                UserHandle.class,
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void beforeHookedMethod(MethodHookParam param) {
+                                        try {
+                                            UserHandle uh = (UserHandle) param.args[0];
+                                            int uid = (int) XposedHelpers.callMethod(uh, "getIdentifier");
+                                            if (uid == PRIVATE_SPACE_USER_ID) {
+                                                XposedBridge.log(TAG + ": LauncherModel " + param.method.getName()
+                                                        + " for user 10 — arming suppressor");
+                                                armSuppressor();
+                                            }
+                                        } catch (Exception e) {
+                                            XposedBridge.log(TAG + ": Suppressor arm error: " + e.getMessage());
+                                        }
+                                    }
+                                });
+                        XposedBridge.log(TAG + ": Hooked " + className + "." + method);
+                        return;
+                    } catch (NoSuchMethodError ignored) {}
+                }
+            } catch (XposedHelpers.ClassNotFoundError ignored) {}
+        }
+    }
+
+    /** Arms the sort suppressor for 3 seconds. */
+    private void armSuppressor() {
+        sSuppressNextSort = true;
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            sSuppressNextSort = false;
+            XposedBridge.log(TAG + ": Sort suppressor disarmed");
+        }, 3000);
     }
 
     // =========================================================================
@@ -159,7 +300,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // =========================================================================
 
     private void hookLabelHider(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Hook View.setVisibility() — intercept by resource entry name
         XposedHelpers.findAndHookMethod(
                 View.class, "setVisibility", int.class,
                 new XC_MethodHook() {
@@ -168,19 +308,16 @@ public class MainHook implements IXposedHookLoadPackage {
                         View view = (View) param.thisObject;
                         int id = view.getId();
                         if (id == View.NO_ID) return;
-
                         try {
                             String entryName = view.getResources().getResourceEntryName(id);
                             if (shouldHideView(entryName)) {
                                 param.args[0] = View.GONE;
                             }
-                        } catch (Resources.NotFoundException ignored) {
-                        }
+                        } catch (Resources.NotFoundException ignored) {}
                     }
                 }
         );
 
-        // Hook setText — blank the "Private" label text
         XposedHelpers.findAndHookMethod(
                 TextView.class, "setText",
                 CharSequence.class, TextView.BufferType.class, boolean.class, int.class,
@@ -217,58 +354,42 @@ public class MainHook implements IXposedHookLoadPackage {
         for (String className : classNames) {
             try {
                 Class<?> clazz = XposedHelpers.findClass(className, lpparam.classLoader);
-
-                try {
-                    XposedHelpers.findAndHookMethod(clazz, "updateView",
-                            new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    hidePrivateSpaceSettingsViews(param.thisObject);
-                                }
-                            });
-                } catch (NoSuchMethodError ignored) {
+                for (String method : new String[]{"updateView", "bind"}) {
+                    try {
+                        XposedHelpers.findAndHookMethod(clazz, method,
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void afterHookedMethod(MethodHookParam param) {
+                                        hidePrivateSpaceSettingsViews(param.thisObject);
+                                    }
+                                });
+                    } catch (NoSuchMethodError ignored) {}
                 }
-
-                try {
-                    XposedHelpers.findAndHookMethod(clazz, "bind",
-                            new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    hidePrivateSpaceSettingsViews(param.thisObject);
-                                }
-                            });
-                } catch (NoSuchMethodError ignored) {
-                }
-
                 XposedBridge.log(TAG + ": Hooked PrivateProfileManager: " + className);
                 break;
-            } catch (XposedHelpers.ClassNotFoundError ignored) {
-            }
+            } catch (XposedHelpers.ClassNotFoundError ignored) {}
         }
     }
 
     private void hidePrivateSpaceSettingsViews(Object manager) {
         try {
-            Object settingsButton = XposedHelpers.getObjectField(manager, "mPrivateSpaceSettingsButton");
-            if (settingsButton instanceof View) {
-                View btn = (View) settingsButton;
-                btn.setVisibility(View.GONE);
-                if (btn.getParent() instanceof View) {
-                    ((View) btn.getParent()).setVisibility(View.GONE);
+            Object btn = XposedHelpers.getObjectField(manager, "mPrivateSpaceSettingsButton");
+            if (btn instanceof View) {
+                ((View) btn).setVisibility(View.GONE);
+                if (((View) btn).getParent() instanceof View) {
+                    ((View) ((View) btn).getParent()).setVisibility(View.GONE);
                 }
             }
         } catch (NoSuchFieldError | ClassCastException e) {
-            XposedBridge.log(TAG + ": Could not find mPrivateSpaceSettingsButton: " + e.getMessage());
+            XposedBridge.log(TAG + ": mPrivateSpaceSettingsButton not found: " + e.getMessage());
         }
     }
 
     // =========================================================================
-    // PART 2: Double-Tap → Unlock Private Space (inline, no separate app)
+    // PART 2: Double-Tap → Unlock Private Space
     // =========================================================================
 
     private void hookDoubleTapGesture(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Hook WorkspaceTouchListener.onDoubleTap (confirmed on device via dexdump)
-        // Fallback: GestureDetector global hook filtered to workspace classes
         hookWorkspaceTouchListenerDoubleTap(lpparam);
     }
 
@@ -281,31 +402,28 @@ public class MainHook implements IXposedHookLoadPackage {
         for (String className : touchListenerClasses) {
             try {
                 Class<?> listenerClass = XposedHelpers.findClass(className, lpparam.classLoader);
-
                 XposedHelpers.findAndHookMethod(listenerClass, "onDoubleTap",
                         android.view.MotionEvent.class,
                         new XC_MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
-                                XposedBridge.log(TAG + ": Double-tap intercepted on primary hook");
+                                XposedBridge.log(TAG + ": Double-tap intercepted");
                                 try {
                                     Object launcher = XposedHelpers.getObjectField(
                                             param.thisObject, "mLauncher");
-                                    Context ctx = (Context) launcher;
-                                    unlockPrivateSpace(ctx);
+                                    unlockPrivateSpace((Context) launcher);
                                 } catch (Exception e) {
-                                    XposedBridge.log(TAG + ": Primary hook error: " + e.getMessage());
+                                    XposedBridge.log(TAG + ": Double-tap hook error: " + e.getMessage());
                                 }
                                 param.setResult(true);
                             }
                         });
                 XposedBridge.log(TAG + ": Hooked onDoubleTap on " + className);
                 return;
-            } catch (XposedHelpers.ClassNotFoundError | NoSuchMethodError ignored) {
-            }
+            } catch (XposedHelpers.ClassNotFoundError | NoSuchMethodError ignored) {}
         }
 
-        XposedBridge.log(TAG + ": WorkspaceTouchListener hook failed, trying fallback");
+        XposedBridge.log(TAG + ": WorkspaceTouchListener not found, trying fallback");
         hookGestureDetectorFallback(lpparam);
     }
 
@@ -319,37 +437,22 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            String callerClass = param.thisObject.getClass().getName();
-                            if (callerClass.contains("Workspace") || callerClass.contains("DragLayer")) {
-                                XposedBridge.log(TAG + ": Fallback double-tap from " + callerClass);
+                            String cls = param.thisObject.getClass().getName();
+                            if (cls.contains("Workspace") || cls.contains("DragLayer")) {
                                 try {
-                                    // WorkspaceTouchListener is NOT a View —
-                                    // get context from mLauncher field
                                     Context ctx = null;
                                     try {
-                                        Object launcher = XposedHelpers.getObjectField(
-                                                param.thisObject, "mLauncher");
-                                        ctx = (Context) launcher;
+                                        ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mLauncher");
                                     } catch (NoSuchFieldError e1) {
-                                        // Try mActivity or other field names
                                         try {
-                                            Object activity = XposedHelpers.getObjectField(
-                                                    param.thisObject, "mActivity");
-                                            ctx = (Context) activity;
+                                            ctx = (Context) XposedHelpers.getObjectField(param.thisObject, "mActivity");
                                         } catch (NoSuchFieldError e2) {
-                                            // Last resort: if it IS a View
                                             if (param.thisObject instanceof View) {
                                                 ctx = ((View) param.thisObject).getContext();
                                             }
                                         }
                                     }
-
-                                    if (ctx != null) {
-                                        unlockPrivateSpace(ctx);
-                                    } else {
-                                        XposedBridge.log(TAG + ": Could not get context from "
-                                                + callerClass);
-                                    }
+                                    if (ctx != null) unlockPrivateSpace(ctx);
                                 } catch (Exception e) {
                                     XposedBridge.log(TAG + ": Fallback error: " + e.getMessage());
                                 }
@@ -359,54 +462,31 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
             );
         } catch (Exception e) {
-            XposedBridge.log(TAG + ": GestureDetector fallback hook failed: " + e.getMessage());
+            XposedBridge.log(TAG + ": GestureDetector fallback failed: " + e.getMessage());
         }
     }
 
-    /**
-     * Unlock Private Space directly from within the Pixel Launcher process.
-     * Calls requestQuietModeEnabled(false, UserHandle.of(10)) — same logic
-     * as the old com.example.privatespaceunlock.MainActivity.
-     */
     private void unlockPrivateSpace(Context context) {
-        if (isUnlocking) {
-            XposedBridge.log(TAG + ": Already unlocking, skipping");
-            return;
-        }
+        if (isUnlocking) return;
         isUnlocking = true;
 
         new Thread(() -> {
             try {
-                XposedBridge.log(TAG + ": Starting Private Space unlock");
-
-                // Step 1: Start user 10
-                Process p = Runtime.getRuntime().exec("su -c am start-user "
-                        + PRIVATE_SPACE_USER_ID);
+                Process p = Runtime.getRuntime().exec("su -c am start-user " + PRIVATE_SPACE_USER_ID);
                 p.waitFor();
-                XposedBridge.log(TAG + ": am start-user completed");
-
                 Thread.sleep(500);
 
-                // Step 2: requestQuietModeEnabled on main thread
                 new Handler(Looper.getMainLooper()).post(() -> {
                     try {
-                        UserManager um = (UserManager) context.getSystemService(
-                                Context.USER_SERVICE);
-                        if (um == null) {
-                            XposedBridge.log(TAG + ": UserManager is null");
-                            isUnlocking = false;
-                            return;
-                        }
+                        UserManager um = (UserManager) context.getSystemService(Context.USER_SERVICE);
+                        if (um == null) { isUnlocking = false; return; }
 
                         Method ofMethod = UserHandle.class.getDeclaredMethod("of", int.class);
                         UserHandle psUser = (UserHandle) ofMethod.invoke(null, PRIVATE_SPACE_USER_ID);
-
                         boolean result = um.requestQuietModeEnabled(false, psUser);
                         XposedBridge.log(TAG + ": requestQuietModeEnabled(false) = " + result);
 
                     } catch (SecurityException se) {
-                        XposedBridge.log(TAG + ": SecurityException, trying UnlockActivity: "
-                                + se.getMessage());
                         unlockViaActivity(context);
                     } catch (Exception e) {
                         XposedBridge.log(TAG + ": Unlock error: " + e.getMessage());
@@ -415,17 +495,13 @@ public class MainHook implements IXposedHookLoadPackage {
                         isUnlocking = false;
                     }
                 });
-
             } catch (Exception e) {
-                XposedBridge.log(TAG + ": Thread error: " + e.getMessage());
+                XposedBridge.log(TAG + ": Unlock thread error: " + e.getMessage());
                 isUnlocking = false;
             }
         }).start();
     }
 
-    /**
-     * Fallback: launch our own UnlockActivity from the priv-app.
-     */
     private void unlockViaActivity(Context context) {
         try {
             android.content.Intent intent = new android.content.Intent();
@@ -436,7 +512,7 @@ public class MainHook implements IXposedHookLoadPackage {
             context.startActivity(intent);
             XposedBridge.log(TAG + ": Launched UnlockActivity");
         } catch (Exception e) {
-            XposedBridge.log(TAG + ": UnlockActivity launch failed: " + e.getMessage());
+            XposedBridge.log(TAG + ": UnlockActivity failed: " + e.getMessage());
         }
     }
 }
