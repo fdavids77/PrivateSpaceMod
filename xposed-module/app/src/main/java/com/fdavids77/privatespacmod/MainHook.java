@@ -18,7 +18,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v3.2 — Unified LSPosed module
+ * PrivateSpaceMod v3.4 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
@@ -28,17 +28,22 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   While open  → WA clones receive notifications normally. ✓
  *   Icon order  → Preserved on every PS unlock. ✓
  *
+ * v3.4 changes vs v3.2:
+ *   - Fix launcher refresh: Hook UserManagerService.sendProfileBroadcast(Intent,int,int)
+ *     in system_server to suppress ACTION_MANAGED_PROFILE_AVAILABLE broadcasts for
+ *     users 11-15 during our start window (sSuppressProfileBroadcast flag).
+ *     The v3.2 approach of suppressing launcher-side onAppsUpdated was too late —
+ *     the suppressor flag was armed AFTER the broadcasts had already fired.
+ *     By blocking the broadcast at source, the launcher never knows the profiles
+ *     started and never reorders icons.
+ *
  * v3.2 changes vs v3.1:
  *   - Block re-quiet: Hook setQuietModeEnabled to intercept and block attempts
  *     to re-enable quiet mode for users 11-15 while PS (user 10) is unlocked.
- *     This prevents Android's ProfileManager / PrivateSpace app from re-applying
- *     QUIET_MODE after our startUser calls.
  *   - Unlock credentials: After startUser(uid), call unlockUser(uid, null) to
- *     move clone profiles from RUNNING_LOCKED → RUNNING_UNLOCKED. This prevents
- *     the PIN/credential prompt when opening a WA clone app after PS unlock.
+ *     move clone profiles from RUNNING_LOCKED → RUNNING_UNLOCKED.
  *   - Guard clone stop: Hook stopSingleUserLU for users 11-15 to block Android
- *     from stopping them via stopExcessRunningUsers / profile timeout, unless PS
- *     itself is stopping (our own cascade stop is still allowed).
+ *     from stopping them via stopExcessRunningUsers / profile timeout.
  *
  * Target: Pixel 9 (tokay), Android 17, Magisk + LSPosed (Vector)
  * Author: fdavids77
@@ -61,6 +66,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static volatile boolean sOurCascadeStopRunning = false;
     // True while PS is unlocked (user 10 has been maybeUnlockUser'd but not stopped)
     private static volatile boolean sPsUnlocked = false;
+    // True while we are starting clone users — suppresses MANAGED_PROFILE_AVAILABLE
+    // broadcasts to the launcher so it never reorders icons.
+    private static volatile boolean sSuppressProfileBroadcast = false;
 
     // Initialized lazily in armSuppressor()
     private static Handler sMainHandler = null;
@@ -186,8 +194,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             // ── Resolve unlockUser(int, IProgressListener) ──────────────────
-            // Called after startUser to move profile RUNNING_LOCKED → RUNNING_UNLOCKED,
-            // preventing the PIN/credential prompt when opening a WA clone app.
             try {
                 Class<?> progressListener = XposedHelpers.findClassIfExists(
                         "android.app.IProgressListener", lpparam.classLoader);
@@ -204,9 +210,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             // ── LOCK: hook stopSingleUserLU ───────────────────────────────────
-            // afterHook: when PS (user 10) stops, cascade stop to users 11-15.
-            // beforeHook: block Android from stopping users 11-15 while PS is unlocked
-            //             (unless our own cascade stop triggered it).
             try {
                 Class<?> iStopCb = XposedHelpers.findClassIfExists(
                         "android.app.IStopUserCallback", lpparam.classLoader);
@@ -276,8 +279,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             // ── BLOCK RE-QUIET: intercept setQuietModeEnabled ────────────────
-            // Block attempts to re-enable quiet mode for users 11-15 while PS is unlocked.
-            // Our own disable (false) calls pass through normally.
             if (umsClass != null && sSetQuietModeMethod != null) {
                 try {
                     if (sSetQuietModeMethod.getParameterCount() == 4) {
@@ -306,6 +307,54 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
 
+            // ── BLOCK LAUNCHER REFRESH: suppress sendProfileBroadcast ────────
+            // UserManagerService.sendProfileBroadcast(Intent, int, int) sends
+            // ACTION_MANAGED_PROFILE_AVAILABLE to the launcher when a managed profile
+            // starts. Hooking it at source (system_server) and suppressing it for
+            // users 11-15 while sSuppressProfileBroadcast is true prevents Pixel
+            // Launcher from calling onAppsUpdated and reordering icons.
+            //
+            // Signature confirmed via dexdump on Android 17:
+            //   sendProfileBroadcast(Landroid/content/Intent;II)V  (PUBLIC FINAL)
+            //   in com.android.server.pm.UserManagerService
+            if (umsClass != null) {
+                try {
+                    XposedHelpers.findAndHookMethod(umsClass, "sendProfileBroadcast",
+                            android.content.Intent.class, int.class, int.class,
+                            new XC_MethodHook() {
+                                @Override
+                                protected void beforeHookedMethod(MethodHookParam param) {
+                                    try {
+                                        // arg[1] = profileUserId (the managed profile user)
+                                        // arg[2] = parentUserId (parent of the profile)
+                                        int profileUid = (int) param.args[1];
+                                        android.content.Intent intent =
+                                                (android.content.Intent) param.args[0];
+                                        String action = intent != null ? intent.getAction() : null;
+                                        if (profileUid >= WA_USER_MIN && profileUid <= WA_USER_MAX
+                                                && sSuppressProfileBroadcast) {
+                                            XposedBridge.log(TAG
+                                                    + ": SUPPRESSED sendProfileBroadcast("
+                                                    + action + ", user=" + profileUid
+                                                    + ") — launcher refresh blocked");
+                                            param.setResult(null);
+                                        } else {
+                                            XposedBridge.log(TAG
+                                                    + ": sendProfileBroadcast("
+                                                    + action + ", user=" + profileUid
+                                                    + ") — allowed");
+                                        }
+                                    } catch (Throwable t) {
+                                        XposedBridge.log(TAG + ": sendProfileBroadcast hook threw: " + t);
+                                    }
+                                }
+                            });
+                    XposedBridge.log(TAG + ": Hooked sendProfileBroadcast (launcher refresh fix)");
+                } catch (NoSuchMethodError e) {
+                    XposedBridge.log(TAG + ": sendProfileBroadcast hook failed: " + e.getMessage());
+                }
+            }
+
         } catch (XposedHelpers.ClassNotFoundError e) {
             XposedBridge.log(TAG + ": UserController not found: " + e.getMessage());
         }
@@ -314,7 +363,6 @@ public class MainHook implements IXposedHookLoadPackage {
     /**
      * Intercepts setQuietModeEnabled for users 11-15.
      * Blocks re-enable (true) calls while PS is unlocked.
-     * Our own disable (false) calls are always allowed through.
      */
     private static void interceptSetQuietMode(XC_MethodHook.MethodHookParam param) {
         try {
@@ -336,7 +384,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * Stop clone users 11-15 via the pre-resolved stopUser Method.
-     * Sets sOurCascadeStopRunning=true so the stopSingleUserLU guard allows through.
      */
     private static void stopCloneUsers(Object ucInstance) {
         if (sStopUserMethod == null) {
@@ -366,16 +413,17 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /**
-     * Start clone users 11-15 via the pre-resolved startUser Method.
-     * 1.5 s delay gives system_server time to finish unlocking user 10 first.
+     * Start clone users 11-15.
      *
      * Per user:
      *   1. setQuietModeEnabled(uid, false) — clear QUIET_MODE flag
      *   2. startUser(uid, 2)              — start in background
      *   3. unlockUser(uid, null)           — unlock credentials → RUNNING_UNLOCKED
      *
-     * Step 3 is critical: without it the profile stays RUNNING_LOCKED and tapping
-     * a WA clone shows a PIN/ConfirmDeviceCredential screen.
+     * sSuppressProfileBroadcast is set true before any startUser call and cleared
+     * 5 seconds after the last one — this prevents sendProfileBroadcast from
+     * delivering ACTION_MANAGED_PROFILE_AVAILABLE to Pixel Launcher, which would
+     * otherwise trigger onAppsUpdated and reorder icons.
      */
     private static void startCloneUsers(Object ucInstance) {
         if (sStartUserMethod == null) {
@@ -384,6 +432,10 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         new Thread(() -> {
             try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+
+            // Arm broadcast suppressor BEFORE any startUser call
+            sSuppressProfileBroadcast = true;
+            XposedBridge.log(TAG + ": sSuppressProfileBroadcast = true");
 
             // Resolve UMS getInstance once for this batch
             Object umsInstance = null;
@@ -448,12 +500,18 @@ public class MainHook implements IXposedHookLoadPackage {
                             + e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             }
-            armSuppressor();
+
+            // Keep suppressor armed for 5 s after last startUser (broadcasts may be async)
+            // then disarm to allow normal profile broadcasts again
+            try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
+            sSuppressProfileBroadcast = false;
+            XposedBridge.log(TAG + ": sSuppressProfileBroadcast = false (disarmed)");
+
         }, "PSMod-StartClones").start();
     }
 
     // =========================================================================
-    // PART 5: Icon reorder fix
+    // PART 5: Icon reorder fix (launcher-side safety net, kept as belt-and-suspenders)
     // =========================================================================
 
     private void hookIconReorderFix(XC_LoadPackage.LoadPackageParam lpparam) {
