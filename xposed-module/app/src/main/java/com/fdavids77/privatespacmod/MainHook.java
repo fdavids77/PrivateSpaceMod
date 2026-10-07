@@ -10,6 +10,7 @@ import android.view.View;
 import android.widget.TextView;
 
 import java.lang.reflect.Method;
+import java.text.Collator;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -18,7 +19,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * PrivateSpaceMod v3.4 — Unified LSPosed module
+ * PrivateSpaceMod v3.5 — Unified LSPosed module
  *
  * Behaviour (Samsung Secure Folder model):
  *   Screen off  → Private Space (user 10) auto-locks.
@@ -27,6 +28,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *                 WA clone users 11-15 restart automatically. ✓
  *   While open  → WA clones receive notifications normally. ✓
  *   Icon order  → Preserved on every PS unlock. ✓
+ *
+ * v3.5 changes vs v3.4:
+ *   - Alphabetical sort: Hook AppInfoComparator.compare(AppInfo,AppInfo) in the
+ *     Pixel Launcher process and replace with java.text.Collator.PRIMARY comparison
+ *     on appTitle/title. Google removed the "Sort apps" setting in Android 13 and
+ *     it has never returned; this hook restores A-Z order in the app drawer.
  *
  * v3.4 changes vs v3.2:
  *   - Fix launcher refresh: Hook UserManagerService.sendProfileBroadcast(Intent,int,int)
@@ -87,6 +94,7 @@ public class MainHook implements IXposedHookLoadPackage {
             hookLabelHider(lpparam);
             hookDoubleTapGesture(lpparam);
             hookIconReorderFix(lpparam);
+            hookAlphabeticalSort(lpparam);
         }
     }
 
@@ -621,6 +629,86 @@ public class MainHook implements IXposedHookLoadPackage {
         sSuppressNextSort = true;
         sMainHandler.removeCallbacks(sDisarmRunnable);
         sMainHandler.postDelayed(sDisarmRunnable, SUPPRESS_MS);
+    }
+
+    // =========================================================================
+    // PART 0: Alphabetical sort fix — force A-Z order in app drawer
+    //
+    // Google removed "Sort apps" from Pixel Launcher in Android 13 and it has
+    // never returned. The internal comparator (AppInfoComparator) uses a
+    // LabelComparator that is influenced by Nexus Launcher's usage-ranking
+    // system, so apps do NOT sort alphabetically by default.
+    //
+    // Fix: Hook AppInfoComparator.compare(AppInfo, AppInfo) in the launcher
+    // process and replace the whole body with a java.text.Collator comparison
+    // on the app label string. This gives proper locale-aware A-Z order.
+    //
+    // Class:  com.android.launcher3.allapps.AppInfoComparator   (unobfuscated)
+    // Method: compare(AppInfo, AppInfo) — typed signature (bridge method handled
+    //         automatically by XposedHelpers via the typed overload)
+    // Fields: appTitle (CharSequence on ItemInfo superclass), title (fallback)
+    // =========================================================================
+
+    private void hookAlphabeticalSort(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Class<?> appInfoClass = XposedHelpers.findClass(
+                    "com.android.launcher3.model.data.AppInfo", lpparam.classLoader);
+            Class<?> comparatorClass = XposedHelpers.findClass(
+                    "com.android.launcher3.allapps.AppInfoComparator", lpparam.classLoader);
+
+            XposedHelpers.findAndHookMethod(comparatorClass, "compare",
+                    appInfoClass, appInfoClass,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Object a = param.args[0];
+                                Object b = param.args[1];
+
+                                // Prefer appTitle (set by launcher from PackageManager label),
+                                // fall back to title (ItemInfo base field).
+                                String labelA = getLabelString(a);
+                                String labelB = getLabelString(b);
+
+                                Collator collator = Collator.getInstance();
+                                collator.setStrength(Collator.PRIMARY); // case/accent insensitive
+                                param.setResult(collator.compare(labelA, labelB));
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + ": alphabeticalSort compare threw: " + t);
+                                // Let original run if we fail
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + ": Hooked AppInfoComparator.compare — alphabetical sort active");
+        } catch (XposedHelpers.ClassNotFoundError e) {
+            XposedBridge.log(TAG + ": hookAlphabeticalSort: class not found: " + e.getMessage());
+        } catch (NoSuchMethodError e) {
+            XposedBridge.log(TAG + ": hookAlphabeticalSort: method not found: " + e.getMessage());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hookAlphabeticalSort: unexpected: " + t);
+        }
+    }
+
+    /**
+     * Extract a display label string from an AppInfo / ItemInfo object.
+     * Tries the appTitle field first (CharSequence set by the launcher from
+     * PackageManager), then falls back to title (base ItemInfo field).
+     * Returns an empty string if neither field yields a non-null value.
+     */
+    private static String getLabelString(Object item) {
+        if (item == null) return "";
+        CharSequence cs = null;
+        try {
+            Object f = XposedHelpers.getObjectField(item, "appTitle");
+            if (f instanceof CharSequence) cs = (CharSequence) f;
+        } catch (NoSuchFieldError ignored) {}
+        if (cs == null || cs.length() == 0) {
+            try {
+                Object f = XposedHelpers.getObjectField(item, "title");
+                if (f instanceof CharSequence) cs = (CharSequence) f;
+            } catch (NoSuchFieldError ignored) {}
+        }
+        return cs != null ? cs.toString() : "";
     }
 
     // =========================================================================
