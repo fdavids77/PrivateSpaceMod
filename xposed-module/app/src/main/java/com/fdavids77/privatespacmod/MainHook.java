@@ -110,62 +110,63 @@ public class MainHook implements IXposedHookLoadPackage {
             Class<?> ucClass = XposedHelpers.findClass(
                     "com.android.server.am.UserController", lpparam.classLoader);
 
-            // Dump all relevant methods to identify correct Android 17 signatures
-            dumpUserControllerMethods(ucClass);
-
-            // ── LOCK: stop clone users when PS stops ──────────────────────
-            boolean lockHooked = false;
+            // ── LOCK: stop clone users when PS (user 10) stops ───────────
+            // Android 17 signature: stopSingleUserLU(int, boolean, IStopUserCallback, UserState$KeyEvictedCallback)
+            // Pass null for both callbacks — we only care about the userId arg.
             try {
-                XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
-                        int.class, boolean.class, boolean.class,
-                        new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
-                                    XposedBridge.log(TAG + ": PS user 10 stopped — cascading stop to 11-15");
-                                    stopCloneUsers();
-                                }
-                            }
-                        });
-                XposedBridge.log(TAG + ": Hooked stopSingleUserLU (3-arg)");
-                lockHooked = true;
-            } catch (NoSuchMethodError ignored) {}
+                Class<?> iStopUserCallback = XposedHelpers.findClassIfExists(
+                        "android.app.IStopUserCallback", lpparam.classLoader);
+                Class<?> keyEvictedCallback = XposedHelpers.findClassIfExists(
+                        "com.android.server.am.UserState$KeyEvictedCallback", lpparam.classLoader);
+                if (iStopUserCallback == null) {
+                    iStopUserCallback = XposedHelpers.findClassIfExists(
+                            "android.app.IStopUserCallback", ClassLoader.getSystemClassLoader());
+                }
+                if (keyEvictedCallback == null) {
+                    keyEvictedCallback = XposedHelpers.findClassIfExists(
+                            "com.android.server.am.UserState$KeyEvictedCallback",
+                            ClassLoader.getSystemClassLoader());
+                }
 
-            if (!lockHooked) {
-                try {
+                if (iStopUserCallback != null && keyEvictedCallback != null) {
                     XposedHelpers.findAndHookMethod(ucClass, "stopSingleUserLU",
-                            int.class, boolean.class,
+                            int.class, boolean.class, iStopUserCallback, keyEvictedCallback,
                             new XC_MethodHook() {
                                 @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
+                                protected void beforeHookedMethod(MethodHookParam param) {
                                     if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
-                                        XposedBridge.log(TAG + ": PS user 10 stopped (2-arg) — cascading stop");
+                                        XposedBridge.log(TAG + ": PS user 10 stopping — cascading stop to 11-15");
                                         stopCloneUsers();
                                     }
                                 }
                             });
-                    XposedBridge.log(TAG + ": Hooked stopSingleUserLU (2-arg)");
-                } catch (NoSuchMethodError e) {
-                    XposedBridge.log(TAG + ": stopSingleUserLU not found: " + e.getMessage());
+                    XposedBridge.log(TAG + ": Hooked stopSingleUserLU(int,bool,IStopUserCallback,KeyEvictedCallback)");
+                } else {
+                    XposedBridge.log(TAG + ": stopSingleUserLU — callback classes not found, skipping lock hook");
                 }
+            } catch (NoSuchMethodError e) {
+                XposedBridge.log(TAG + ": stopSingleUserLU hook failed: " + e.getMessage());
             }
 
-            // ── UNLOCK: restart clone users when PS unlocks ───────────────
+            // ── UNLOCK: restart clone users when PS (user 10) unlocks ─────
+            // Android 17: onUserUnlocked(int) is gone; maybeUnlockUser(int) fires on unlock.
+            // finishUserUnlocked(UserState) is the definitive point but needs UserState.
+            // We hook both: maybeUnlockUser as the trigger, finishUserUnlocked as confirmation.
             try {
-                XposedHelpers.findAndHookMethod(ucClass, "onUserUnlocked",
+                XposedHelpers.findAndHookMethod(ucClass, "maybeUnlockUser",
                         int.class,
                         new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
                                 if ((int) param.args[0] == PRIVATE_SPACE_USER_ID) {
-                                    XposedBridge.log(TAG + ": PS user 10 unlocked — restarting clones 11-15");
+                                    XposedBridge.log(TAG + ": PS user 10 maybeUnlockUser — restarting clones 11-15");
                                     startCloneUsers();
                                 }
                             }
                         });
-                XposedBridge.log(TAG + ": Hooked UserController.onUserUnlocked");
+                XposedBridge.log(TAG + ": Hooked UserController.maybeUnlockUser(int)");
             } catch (NoSuchMethodError e) {
-                XposedBridge.log(TAG + ": onUserUnlocked not found: " + e.getMessage());
+                XposedBridge.log(TAG + ": maybeUnlockUser not found: " + e.getMessage());
             }
 
         } catch (XposedHelpers.ClassNotFoundError e) {

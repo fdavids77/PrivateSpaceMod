@@ -10,8 +10,8 @@ android {
         applicationId = "com.fdavids77.privatespacmod"
         minSdk = 33
         targetSdk = 35
-        versionCode = 6
-        versionName = "2.5"
+        versionCode = 7
+        versionName = "2.6"
     }
 
     signingConfigs {
