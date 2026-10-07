@@ -263,15 +263,21 @@ public class MainHook implements IXposedHookLoadPackage {
                 try {
                     int paramCount = sStartUserMethod.getParameterCount();
                     if (paramCount == 2 && sStartUserMethod.getParameterTypes()[1] == int.class) {
-                        // startUser(int, int) — startMode 0 = START_MODE_BACKGROUND
-                        sStartUserMethod.invoke(ucInstance, uid, 0);
+                        // startUser(int, int startMode)
+                        // UserManager.USER_START_MODE_BACKGROUND = 2 (not 0 — 0 is FOREGROUND)
+                        sStartUserMethod.invoke(ucInstance, uid, 2);
                     } else {
                         // startUser(int, boolean) — background = true
                         sStartUserMethod.invoke(ucInstance, uid, true);
                     }
                     XposedBridge.log(TAG + ": startUser(" + uid + ") OK");
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    Throwable cause = e.getCause();
+                    XposedBridge.log(TAG + ": startUser(" + uid + ") ITE cause: "
+                            + (cause != null ? cause.getClass().getSimpleName() + ": " + cause.getMessage() : "null"));
                 } catch (Exception e) {
-                    XposedBridge.log(TAG + ": startUser(" + uid + ") failed: " + e.getMessage());
+                    XposedBridge.log(TAG + ": startUser(" + uid + ") failed: "
+                            + e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
             }
             armSuppressor();
